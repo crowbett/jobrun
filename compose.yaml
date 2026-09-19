@@ -1,0 +1,33 @@
+# Local dependencies for jobrun: Postgres 17 only (the queue, the schedules and the
+# exactly-once ledger all live in Postgres; there is no broker in v1, see docs/PLAN.md).
+#   docker compose up -d --wait
+#   task migrate          # goose up against DATABASE_URL
+#
+# Observability is NOT duplicated here: bring up the shared devstack instead
+# (`cd ~/dev/_templates/docker-stack; docker compose --profile obs up -d --wait`)
+# and point OTEL_EXPORTER_OTLP_ENDPOINT at its collector on localhost:4317.
+name: jobrun
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: jobrun
+      POSTGRES_PASSWORD: jobrun
+      POSTGRES_DB: jobrun
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    # 5434 on the host: orders holds 5433, the devstack holds 5432.
+    ports:
+      - "${JOBRUN_PG_PORT:-5434}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobrun -d jobrun"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pgdata:

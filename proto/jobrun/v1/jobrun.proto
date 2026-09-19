@@ -1,0 +1,313 @@
+syntax = "proto3";
+
+package jobrun.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1";
+
+// JobService is the control plane of the queue: enqueue, inspect and steer jobs.
+// Workers are in-process handlers inside jobrund (see docs/PLAN.md, Decision 3);
+// this service never leases work to a remote process.
+//
+// Status codes: INVALID_ARGUMENT (validation, bad cron, bad page_token),
+// NOT_FOUND, FAILED_PRECONDITION (not cancellable / not retryable),
+// ALREADY_EXISTS (idempotency key reused with a different body), INTERNAL otherwise.
+service JobService {
+  // Enqueue inserts one job. Replaying the same (queue, idempotency_key) returns
+  // the stored job with created=false instead of inserting a second row.
+  rpc Enqueue(EnqueueRequest) returns (EnqueueResponse) {}
+  // Get returns one job by id, optionally with its transition history.
+  rpc Get(GetRequest) returns (GetResponse) {}
+  // List pages jobs newest first with an opaque keyset page_token.
+  rpc List(ListRequest) returns (ListResponse) {}
+  // Cancel stops a job: QUEUED becomes CANCELLED at once; a LEASED job gets
+  // cancel_requested set and its handler context is cancelled on the next
+  // heartbeat (cooperative), after which it also ends CANCELLED.
+  rpc Cancel(CancelRequest) returns (CancelResponse) {}
+  // Retry moves a DEAD or CANCELLED job back to QUEUED with attempts reset to 0.
+  rpc Retry(RetryRequest) returns (RetryResponse) {}
+  // Purge deletes finished jobs by queue, status and age.
+  rpc Purge(PurgeRequest) returns (PurgeResponse) {}
+  // Stats returns the cached queue depth by queue and status (refreshed every
+  // few seconds, never computed per call).
+  rpc Stats(StatsRequest) returns (StatsResponse) {}
+}
+
+// ScheduleService manages cron templates that the scheduler materialises into jobs.
+// Cron expressions are standard 5-field (minute hour day-of-month month day-of-week)
+// plus @hourly/@daily/@weekly/@monthly/@yearly; timezone is an IANA name.
+service ScheduleService {
+  // CreateSchedule registers a new schedule (name is unique).
+  rpc CreateSchedule(CreateScheduleRequest) returns (CreateScheduleResponse) {}
+  // UpdateSchedule changes cron, timezone, template or enabled; unset fields keep their value.
+  rpc UpdateSchedule(UpdateScheduleRequest) returns (UpdateScheduleResponse) {}
+  // DeleteSchedule removes a schedule; jobs it already materialised are untouched.
+  rpc DeleteSchedule(DeleteScheduleRequest) returns (DeleteScheduleResponse) {}
+  // GetSchedule returns one schedule by id.
+  rpc GetSchedule(GetScheduleRequest) returns (GetScheduleResponse) {}
+  // ListSchedules pages all schedules by name.
+  rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse) {}
+}
+
+// NOT in v1: a worker protocol for out-of-process workers. Reserved here so the
+// package has room for it without renumbering anything. It would pair with a
+// push Dispatcher (docs/PLAN.md, Decision 2) and degrade exactly-once effects to
+// effectively-once, which is why it is not implemented.
+//
+// service WorkerService {
+//   rpc Lease(stream LeaseRequest) returns (stream LeaseResponse) {}
+//   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+//   rpc Complete(CompleteRequest) returns (CompleteResponse) {}
+//   rpc Fail(FailRequest) returns (FailResponse) {}
+// }
+
+// JobStatus is the job lifecycle.
+//
+//   QUEUED -> LEASED -> SUCCEEDED
+//   LEASED -> QUEUED            (retry: run_at moves into the future by the backoff policy)
+//   LEASED -> DEAD              (attempts exhausted or a permanent failure; terminal until Retry)
+//   QUEUED|LEASED -> CANCELLED  (terminal until Retry)
+//   DEAD|CANCELLED -> QUEUED    (Retry, attempts reset)
+//
+// A job waiting for its next attempt is QUEUED with a future run_at. FAILED is
+// reserved ("last attempt failed, not yet dead") and is never written in v1.
+enum JobStatus {
+  JOB_STATUS_UNSPECIFIED = 0;
+  JOB_STATUS_QUEUED = 1;
+  JOB_STATUS_LEASED = 2;
+  JOB_STATUS_SUCCEEDED = 3;
+  JOB_STATUS_FAILED = 4;
+  JOB_STATUS_DEAD = 5;
+  JOB_STATUS_CANCELLED = 6;
+}
+
+// BackoffPolicy is exponential backoff with full jitter:
+// delay(n) = rand(0, min(base * factor^(n-1), max)) for attempt n (1-based).
+// Unset fields take the server defaults (1s, 5m, 2.0, jitter on).
+message BackoffPolicy {
+  google.protobuf.Duration base = 1;
+  google.protobuf.Duration max = 2;
+  double factor = 3;
+  bool jitter = 4;
+}
+
+// Job is one unit of work and its full state.
+message Job {
+  string id = 1;
+  string queue = 2;
+  string type = 3;
+  // payload is a JSON document (stored as jsonb); at most 256 KiB.
+  bytes payload = 4;
+  JobStatus status = 5;
+  // priority orders claims within a queue: higher first, -100..100.
+  int32 priority = 6;
+  google.protobuf.Timestamp run_at = 7;
+  int32 attempts = 8;
+  int32 max_attempts = 9;
+  BackoffPolicy backoff = 10;
+  string lease_owner = 11;
+  google.protobuf.Timestamp lease_until = 12;
+  string last_error = 13;
+  string idempotency_key = 14;
+  google.protobuf.Timestamp created_at = 15;
+  google.protobuf.Timestamp updated_at = 16;
+  google.protobuf.Timestamp started_at = 17;
+  google.protobuf.Timestamp finished_at = 18;
+  // cancel_requested is set by Cancel on a LEASED job until the worker gives it up.
+  bool cancel_requested = 19;
+}
+
+// JobEvent is one row of the append-only transition history of a job.
+message JobEvent {
+  string job_id = 1;
+  string queue = 2;
+  string type = 3;
+  // from_status is UNSPECIFIED for the enqueue event.
+  JobStatus from_status = 4;
+  JobStatus to_status = 5;
+  int32 attempt = 6;
+  google.protobuf.Timestamp at = 7;
+  string error = 8;
+}
+
+// JobTemplate is what a schedule enqueues on every firing.
+message JobTemplate {
+  string queue = 1;
+  string type = 2;
+  bytes payload = 3;
+  int32 priority = 4;
+  int32 max_attempts = 5;
+  BackoffPolicy backoff = 6;
+}
+
+// Schedule is a cron template. The scheduler enqueues template at every next_run
+// with idempotency_key "sched:<id>:<next_run RFC3339>", so a firing is never duplicated.
+message Schedule {
+  string id = 1;
+  string name = 2;
+  string cron = 3;
+  string timezone = 4;
+  JobTemplate template = 5;
+  bool enabled = 6;
+  google.protobuf.Timestamp next_run = 7;
+  google.protobuf.Timestamp last_run = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+message EnqueueRequest {
+  // queue and type are 1..64 chars of [a-z0-9._-].
+  string queue = 1;
+  string type = 2;
+  // payload is a JSON document; empty means {}.
+  bytes payload = 3;
+  int32 priority = 4;
+  // when the job becomes claimable; unset means now (database clock).
+  oneof when {
+    google.protobuf.Timestamp run_at = 5;
+    google.protobuf.Duration delay = 6;
+  }
+  // max_attempts 1..100; 0 means the default (5).
+  int32 max_attempts = 7;
+  BackoffPolicy backoff = 8;
+  // idempotency_key is optional and unique per queue.
+  string idempotency_key = 9;
+}
+
+message EnqueueResponse {
+  Job job = 1;
+  // created is false when an idempotent replay returned the stored job.
+  bool created = 2;
+}
+
+message GetRequest {
+  string id = 1;
+  bool include_events = 2;
+}
+
+message GetResponse {
+  Job job = 1;
+  repeated JobEvent events = 2;
+}
+
+message ListRequest {
+  // queue is optional; empty lists every queue.
+  string queue = 1;
+  // status is optional; UNSPECIFIED means every status.
+  JobStatus status = 2;
+  // type is optional.
+  string type = 3;
+  // page_token is the next_page_token of the previous page, or empty for the first page.
+  string page_token = 4;
+  // page_size is 1..200; 0 means the default (50).
+  int32 page_size = 5;
+}
+
+message ListResponse {
+  repeated Job jobs = 1;
+  // next_page_token is empty when there are no more pages.
+  string next_page_token = 2;
+}
+
+message CancelRequest {
+  string id = 1;
+}
+
+message CancelResponse {
+  Job job = 1;
+}
+
+message RetryRequest {
+  string id = 1;
+}
+
+message RetryResponse {
+  Job job = 1;
+}
+
+message PurgeRequest {
+  // queue is optional; empty purges every queue.
+  string queue = 1;
+  // statuses to delete; empty means SUCCEEDED, CANCELLED and DEAD.
+  repeated JobStatus statuses = 2;
+  // older_than filters on finished_at; unset means everything.
+  google.protobuf.Duration older_than = 3;
+  // limit bounds one call; 0 means the server default.
+  int32 limit = 4;
+}
+
+message PurgeResponse {
+  int64 deleted = 1;
+}
+
+message StatsRequest {
+  // queue is optional; empty returns every queue.
+  string queue = 1;
+}
+
+// QueueDepth is one (queue, status) cell of the depth table.
+message QueueDepth {
+  string queue = 1;
+  JobStatus status = 2;
+  int64 count = 3;
+  google.protobuf.Timestamp oldest_run_at = 4;
+}
+
+message StatsResponse {
+  repeated QueueDepth depths = 1;
+  // as_of is when the cached snapshot was taken.
+  google.protobuf.Timestamp as_of = 2;
+}
+
+message CreateScheduleRequest {
+  string name = 1;
+  string cron = 2;
+  // timezone is an IANA name; empty means UTC.
+  string timezone = 3;
+  JobTemplate template = 4;
+  // enabled defaults to true when the request leaves it unset.
+  optional bool enabled = 5;
+}
+
+message CreateScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message UpdateScheduleRequest {
+  string id = 1;
+  optional string cron = 2;
+  optional string timezone = 3;
+  JobTemplate template = 4;
+  optional bool enabled = 5;
+}
+
+message UpdateScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message DeleteScheduleRequest {
+  string id = 1;
+}
+
+message DeleteScheduleResponse {}
+
+message GetScheduleRequest {
+  string id = 1;
+}
+
+message GetScheduleResponse {
+  Schedule schedule = 1;
+}
+
+message ListSchedulesRequest {
+  string page_token = 1;
+  // page_size is 1..200; 0 means the default (50).
+  int32 page_size = 2;
+}
+
+message ListSchedulesResponse {
+  repeated Schedule schedules = 1;
+  string next_page_token = 2;
+}

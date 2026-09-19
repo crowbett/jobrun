@@ -2,14 +2,16 @@
 version: "3"
 
 vars:
-  APP: server
-  MAIN: ./cmd/server
+  APP: jobrund
+  MAIN: ./cmd/jobrund
   BIN: bin/{{.APP}}{{exeExt}}
   IMAGE: '{{.APP}}:local'
   VERSION:
     sh: git describe --tags --always --dirty 2>/dev/null || echo dev
   LDFLAGS: -s -w -X main.version={{.VERSION}}
-  GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50051"}}'
+  GRPC_ADDR: '{{.GRPC_ADDR | default "localhost:50052"}}'
+  DATABASE_URL: '{{.DATABASE_URL | default "postgres://jobrun:jobrun@localhost:5434/jobrun?sslmode=disable"}}'
+  MIGRATIONS: internal/postgres/migrations
 
 env:
   CGO_ENABLED: "0"
@@ -37,29 +39,83 @@ tasks:
       - go mod verify
 
   build:
-    desc: Build the server binary into bin/
+    desc: Build jobrund and the jobrun CLI into bin/
     deps: [gen]
     cmds:
       - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.BIN}} {{.MAIN}}
+      - go build -trimpath -ldflags="{{.LDFLAGS}}" -o bin/jobrun{{exeExt}} ./cmd/jobrun
     sources:
       - "**/*.go"
       - go.mod
       - go.sum
     generates:
       - "{{.BIN}}"
+      - bin/jobrun{{exeExt}}
 
   run:
-    desc: Run the server locally on :50051
+    desc: "Run jobrund locally on :50052 (stack must be up: task db:up migrate)"
     deps: [gen]
     cmds:
       - go run {{.MAIN}}
     env:
       LOG_FORMAT: text
+      DATABASE_URL: "{{.DATABASE_URL}}"
 
   client:
-    desc: Smoke-test a running server (health + Echo + EchoStream)
+    desc: "Run the jobrun CLI against a running jobrund (task client -- enqueue|get|list|cancel|retry|schedule ...)"
     cmds:
-      - go run ./cmd/client -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+      - go run ./cmd/jobrun -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
+
+  bench:
+    desc: "Load test a running jobrund (task bench -- --rate 200 --duration 60s)"
+    cmds:
+      - go run ./cmd/jobrun -addr {{.GRPC_ADDR}} bench {{.CLI_ARGS}}
+    env:
+      DATABASE_URL: "{{.DATABASE_URL}}"
+
+  db:up:
+    desc: Start postgres (5434) and wait for health
+    cmds:
+      - docker compose up -d --wait
+
+  db:down:
+    desc: Stop the compose stack (keeps volumes)
+    cmds:
+      - docker compose down
+
+  migrate:
+    desc: goose up against DATABASE_URL
+    cmds:
+      - goose -dir {{.MIGRATIONS}} postgres "{{.DATABASE_URL}}" up
+
+  migrate:down:
+    desc: goose down one step
+    cmds:
+      - goose -dir {{.MIGRATIONS}} postgres "{{.DATABASE_URL}}" down
+
+  migrate:status:
+    desc: goose status against DATABASE_URL
+    cmds:
+      - goose -dir {{.MIGRATIONS}} postgres "{{.DATABASE_URL}}" status
+
+  sqlc:
+    desc: Regenerate internal/postgres/sqlc from db/query + migrations
+    cmds:
+      - sqlc generate
+      - sqlc vet
+    sources:
+      - db/query/*.sql
+      - "{{.MIGRATIONS}}/*.sql"
+      - sqlc.yaml
+
+  test:integration:
+    desc: Tests that need the compose stack (-tags integration)
+    deps: [db:up]
+    cmds:
+      - go test -race -count=1 -tags integration ./...
+    env:
+      CGO_ENABLED: "1"
+      TEST_DATABASE_URL: "{{.DATABASE_URL}}"
 
   test:
     desc: Run tests with the race detector (needs a C compiler on Windows)
@@ -121,9 +177,9 @@ tasks:
       - docker build -t {{.IMAGE}} --build-arg VERSION={{.VERSION}} .
 
   docker:run:
-    desc: Run the container on :50051
+    desc: "Run the container on :50052 (DATABASE_URL must point at a reachable postgres)"
     cmds:
-      - docker run --rm -p 50051:50051 -e LOG_FORMAT=text {{.IMAGE}}
+      - docker run --rm -p 50052:50052 -e LOG_FORMAT=text -e DATABASE_URL="{{.DATABASE_URL}}" {{.IMAGE}}
 
   clean:
     cmds:

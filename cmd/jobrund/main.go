@@ -1,4 +1,9 @@
-// Command server is the gRPC server entrypoint.
+// Command jobrund is the jobrun daemon: gRPC control plane, worker pool,
+// scheduler, reaper and the /admin page in one process.
+//
+// This is the minimal bring-up main (health + reflection only); the integrator
+// wires config -> obs -> pool+migrate -> registry -> worker/scheduler/reaper ->
+// grpc -> admin http -> staged teardown on top of it.
 package main
 
 import (
@@ -18,9 +23,8 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
 
-	echov1 "github.com/crowbett/jobrun/gen/echo/v1"
+	jobrunv1 "github.com/crowbett/jobrun/gen/jobrun/v1"
 	"github.com/crowbett/jobrun/internal/interceptor"
-	"github.com/crowbett/jobrun/internal/server"
 )
 
 // version is injected at build time: -ldflags="-X main.version=v1.2.3".
@@ -34,8 +38,8 @@ func main() {
 }
 
 func run() error {
-	addr := envOr("GRPC_ADDR", ":50051")
-	shutdownTimeout, err := time.ParseDuration(envOr("SHUTDOWN_TIMEOUT", "10s"))
+	addr := envOr("GRPC_ADDR", ":50052")
+	stopTimeout, err := time.ParseDuration(envOr("SHUTDOWN_TIMEOUT", "10s"))
 	if err != nil {
 		return fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err)
 	}
@@ -69,13 +73,13 @@ func run() error {
 		}),
 	)
 
-	// Application services.
-	server.NewEchoServer().Register(srv)
-
 	// Health: `grpc.health.v1.Health/Check` for load balancers and k8s grpc probes.
+	// The application services are registered by the integrator; until then the
+	// service names report SERVING so the CLI health check has something to ask.
 	healthSrv := health.NewServer()
 	healthv1.RegisterHealthServer(srv, healthSrv)
-	healthSrv.SetServingStatus(echov1.EchoService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
+	healthSrv.SetServingStatus(jobrunv1.JobService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
+	healthSrv.SetServingStatus(jobrunv1.ScheduleService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
 
 	// Reflection: lets grpcurl / evans discover services without the .proto files.
 	reflection.Register(srv)
@@ -88,7 +92,7 @@ func run() error {
 
 	select {
 	case <-ctx.Done():
-		logger.Info("shutdown signal received")
+		logger.Info("stop signal received")
 	case err := <-errCh:
 		return fmt.Errorf("serve: %w", err)
 	}
@@ -104,8 +108,8 @@ func run() error {
 	select {
 	case <-done:
 		logger.Info("server stopped gracefully")
-	case <-time.After(shutdownTimeout):
-		logger.Warn("graceful stop timed out; forcing", "timeout", shutdownTimeout)
+	case <-time.After(stopTimeout):
+		logger.Warn("graceful stop timed out; forcing", "timeout", stopTimeout)
 		srv.Stop()
 	}
 	return nil
