@@ -1,0 +1,236 @@
+{
+  "title": "jobrun (durable job queue)",
+  "uid": "jobrun-queue",
+  "tags": ["jobrun", "go", "postgres"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "type": "datasource",
+        "query": "prometheus",
+        "label": "Prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      },
+      {
+        "name": "queue",
+        "type": "query",
+        "label": "Queue",
+        "datasource": { "type": "prometheus", "uid": "${ds}" },
+        "query": "label_values(jobrun_queue_depth, queue)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Queue depth by queue / status",
+      "description": "From the 5 s depth cache. A growing queued line means workers are behind; a flat leased line at concurrency means saturation.",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "jobrun_queue_depth{queue=~\"$queue\"}",
+          "legendFormat": "{{queue}} {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Throughput by outcome (jobs/s)",
+      "description": "rate(jobrun_jobs_total) by status: succeeded, retried, dead, cancelled.",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*dead.*" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*succeeded.*" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }] }
+        ]
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (rate(jobrun_jobs_total{queue=~\"$queue\"}[1m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Job duration p50 / p99",
+      "description": "Handler run time from jobrun_job_duration_seconds (fed by the worker through admin.DurationObserver).",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "P50",
+          "expr": "histogram_quantile(0.50, sum by (le, queue, type) (rate(jobrun_job_duration_seconds_bucket{queue=~\"$queue\"}[1m])))",
+          "legendFormat": "p50 {{queue}}/{{type}}"
+        },
+        {
+          "refId": "P99",
+          "expr": "histogram_quantile(0.99, sum by (le, queue, type) (rate(jobrun_job_duration_seconds_bucket{queue=~\"$queue\"}[1m])))",
+          "legendFormat": "p99 {{queue}}/{{type}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Oldest queued job age",
+      "description": "now - min(run_at) of queued jobs per queue. Rising steadily means nothing is being claimed.",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "jobrun_queue_oldest_age_seconds{queue=~\"$queue\"}",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Dead jobs (30m)",
+      "description": "Jobs that exhausted their attempts or failed permanently. Anything above zero needs a look (jobrun list --status dead, then retry or purge).",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 0, "y": 16, "w": 6, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(jobrun_dead_total[30m])",
+          "legendFormat": "dead"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Dead jobs sitting in queues",
+      "description": "Current status=dead rows from the depth table (until purged or retried).",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 6, "y": 16, "w": 6, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(jobrun_queue_depth{status=\"dead\", queue=~\"$queue\"})",
+          "legendFormat": "dead"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Lease expirations/s",
+      "description": "Leases the reaper had to requeue or kill. Non-zero under normal load means handlers outrun LEASE_TTL or the heartbeater is stalled.",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "fixed", "fixedColor": "orange" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(jobrun_lease_expired_total[1m])",
+          "legendFormat": "expired"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Scheduler ticks/s (leader liveness)",
+      "description": "Expected ~0.2/s (one tick per 5 s) on exactly one process. Zero everywhere means no leader holds the advisory lock.",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 18, "y": 16, "w": 6, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0.1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(jobrun_scheduler_ticks_total[1m])",
+          "legendFormat": "ticks"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Build",
+      "datasource": { "type": "prometheus", "uid": "${ds}" },
+      "gridPos": { "x": 0, "y": 22, "w": 6, "h": 4 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "/^version$/" }, "textMode": "name", "colorMode": "none" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "jobrun_build_info",
+          "legendFormat": "{{version}} ({{go_version}})",
+          "instant": true
+        }
+      ]
+    }
+  ]
+}

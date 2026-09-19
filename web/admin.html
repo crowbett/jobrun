@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jobrun</title>
+<style>
+  :root { --bg:#0b0713; --panel:#140c22; --line:#2a1a45; --fg:#e8dcff; --dim:#7d6a9e; --mag:#ff3fd0; --cyan:#22e3ff; --amber:#ffb830; --green:#3dff9a; --red:#ff4d6d; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:14px/1.4 ui-monospace,Consolas,"Cascadia Mono",monospace; }
+  h1 { margin:0 0 12px; font-size:16px; letter-spacing:.35em; text-transform:uppercase; color:var(--cyan); text-shadow:0 0 12px var(--cyan); }
+  h1 span { color:var(--mag); text-shadow:0 0 12px var(--mag); }
+  #status { float:right; font-size:12px; color:var(--dim); letter-spacing:.1em; }
+  #status.live { color:var(--cyan); } #status.down { color:var(--mag); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; box-shadow:0 0 18px rgba(255,63,208,.08); min-width:0; }
+  .card h2 { margin:0 0 8px; font-size:11px; letter-spacing:.25em; text-transform:uppercase; color:var(--dim); }
+  .card h2 small { float:right; letter-spacing:0; text-transform:none; }
+  .wide { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:3px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:normal; font-size:11px; letter-spacing:.15em; text-transform:uppercase; }
+  td.n { text-align:right; color:var(--cyan); }
+  .counters { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:8px; }
+  .counter { text-align:center; padding:6px 0; border:1px solid var(--line); border-radius:6px; }
+  .counter b { display:block; font-size:24px; line-height:1.1; font-weight:normal; text-shadow:0 0 14px currentColor; }
+  .counter span { font-size:10px; letter-spacing:.2em; text-transform:uppercase; color:var(--dim); }
+  .queued { color:var(--amber); } .leased { color:var(--cyan); } .succeeded { color:var(--green); }
+  .dead { color:var(--red); } .cancelled { color:var(--dim); } .retried, .failed { color:var(--mag); }
+  #log { max-height:420px; overflow-y:auto; }
+  #log td.id { color:var(--dim); font-size:11px; }
+  #log td.err { color:var(--red); max-width:360px; overflow:hidden; text-overflow:ellipsis; }
+  #log tr.new { animation:flash .8s ease-out; }
+  @keyframes flash { from { background:rgba(34,227,255,.18); } to { background:transparent; } }
+  .empty { color:var(--dim); padding:8px 0; }
+</style>
+</head>
+<body>
+<h1><span>job</span>run <span id="status">connecting</span></h1>
+<div class="grid">
+  <div class="card"><h2>counters <small id="since">since page load</small></h2>
+    <div class="counters" id="counters"></div></div>
+  <div class="card"><h2>queue depth <small id="asof"></small></h2>
+    <table><thead><tr><th>queue</th><th>status</th><th class="n">jobs</th><th>oldest</th></tr></thead>
+    <tbody id="depth"><tr><td colspan="4" class="empty">waiting for snapshot</td></tr></tbody></table></div>
+  <div class="card wide"><h2>transitions <small id="count">0</small></h2>
+    <div id="log"><table><thead><tr><th>at</th><th>queue</th><th>type</th><th>job</th><th>from</th><th>to</th><th class="n">att</th><th>error</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="8" class="empty">no transitions yet</td></tr></tbody></table></div></div>
+</div>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  const MAX_ROWS = 200;
+  const KINDS = ['queued', 'leased', 'succeeded', 'retried', 'dead', 'cancelled', 'failed'];
+  const counts = Object.fromEntries(KINDS.map(k => [k, 0]));
+  let total = 0;
+
+  function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+  function hhmmss(iso) { const d = new Date(iso); return isNaN(d) ? '--' : d.toLocaleTimeString(); }
+  function age(iso) {
+    if (!iso) return '--';
+    let s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    if (s < 60) return s.toFixed(0) + 's';
+    if (s < 3600) return (s / 60).toFixed(0) + 'm';
+    return (s / 3600).toFixed(1) + 'h';
+  }
+
+  function renderCounters() {
+    const box = $('counters'); box.textContent = '';
+    for (const k of KINDS) {
+      const c = el('div', 'counter ' + k);
+      c.appendChild(el('b', null, counts[k]));
+      c.appendChild(el('span', null, k));
+      box.appendChild(c);
+    }
+  }
+
+  function renderDepth(rows) {
+    const body = $('depth'); body.textContent = '';
+    if (!rows || !rows.length) { body.appendChild(el('tr')).appendChild(el('td', 'empty', 'no jobs')).colSpan = 4; return; }
+    rows.sort((a, b) => a.queue.localeCompare(b.queue) || a.status.localeCompare(b.status));
+    for (const r of rows) {
+      const tr = el('tr');
+      tr.appendChild(el('td', null, r.queue));
+      tr.appendChild(el('td', r.status, r.status));
+      tr.appendChild(el('td', 'n', r.n));
+      tr.appendChild(el('td', null, r.n ? age(r.oldest_run_at) : '--'));
+      body.appendChild(tr);
+    }
+    $('asof').textContent = 'as of ' + new Date().toLocaleTimeString();
+  }
+
+  // The event kind for the counters: a leased->queued edge is a retry, not a plain enqueue.
+  function kindOf(e) { return e.from === 'leased' && e.to === 'queued' ? 'retried' : e.to; }
+
+  function renderEvent(e) {
+    const kind = kindOf(e);
+    if (kind in counts) counts[kind]++;
+    total++;
+    $('count').textContent = total;
+    renderCounters();
+    const body = $('rows');
+    if (body.firstChild && body.firstChild.querySelector('.empty')) body.textContent = '';
+    const tr = el('tr', 'new');
+    tr.appendChild(el('td', null, hhmmss(e.at)));
+    tr.appendChild(el('td', null, e.queue));
+    tr.appendChild(el('td', null, e.type));
+    tr.appendChild(el('td', 'id', (e.job_id || '').slice(0, 8)));
+    tr.appendChild(el('td', e.from || 'cancelled', e.from || '-'));
+    tr.appendChild(el('td', kind, e.to));
+    tr.appendChild(el('td', 'n', e.attempt));
+    const err = el('td', 'err', e.error || ''); err.title = e.error || ''; tr.appendChild(err);
+    body.insertBefore(tr, body.firstChild);
+    while (body.children.length > MAX_ROWS) body.removeChild(body.lastChild);
+  }
+
+  let es, retry = 1000;
+  function connect() {
+    es = new EventSource('/admin/events');
+    es.addEventListener('snapshot', e => { retry = 1000; renderDepth(JSON.parse(e.data)); });
+    es.addEventListener('job', e => { renderEvent(JSON.parse(e.data)); });
+    es.onopen = () => { $('status').textContent = 'live'; $('status').className = 'live'; };
+    es.onerror = () => {
+      es.close(); $('status').textContent = 'reconnecting'; $('status').className = 'down';
+      setTimeout(connect, retry); retry = Math.min(retry * 2, 15000);
+    };
+  }
+  renderCounters();
+  connect();
+})();
+</script>
+</body>
+</html>
