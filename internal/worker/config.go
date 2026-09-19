@@ -42,6 +42,16 @@ type Config struct {
 	// PollFloor is the claim loop's tick when the dispatcher stays silent
 	// (DefaultPollFloor).
 	PollFloor time.Duration
+	// Durations, when set, receives the wall time of every handler run
+	// (success or failure) so jobrun_job_duration_seconds can be exposed
+	// without the worker importing internal/admin. Optional.
+	Durations DurationObserver
+}
+
+// DurationObserver observes one handler run per call. *admin.Histogram
+// satisfies it; cmd/jobrund passes it through Config.Durations.
+type DurationObserver interface {
+	ObserveDuration(queue, typ string, d time.Duration)
 }
 
 func (c Config) withDefaults() Config {

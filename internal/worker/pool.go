@@ -221,6 +221,9 @@ func (p *Pool) runJob(base context.Context, j job.Job) {
 	started := p.now()
 	commit, err := p.handle(jctx, j)
 	elapsed := p.now().Sub(started)
+	if p.cfg.Durations != nil {
+		p.cfg.Durations.ObserveDuration(j.Queue, j.Type, elapsed)
+	}
 
 	sctx, scancel := context.WithTimeout(base, storeTimeout)
 	defer scancel()
