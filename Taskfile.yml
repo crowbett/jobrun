@@ -53,13 +53,19 @@ tasks:
       - bin/jobrun{{exeExt}}
 
   run:
-    desc: "Run jobrund locally on :50052 (stack must be up: task db:up migrate)"
+    desc: "Run jobrund locally (gRPC :50052, admin 127.0.0.1:9110; stack must be up: task db:up). Migrates on start."
     deps: [gen]
     cmds:
-      - go run {{.MAIN}}
+      - go run -ldflags="-X main.version={{.VERSION}}" {{.MAIN}}
     env:
       LOG_FORMAT: text
       DATABASE_URL: "{{.DATABASE_URL}}"
+      WORKER_QUEUES: '{{.WORKER_QUEUES | default "default,bench"}}'
+
+  admin:
+    desc: Open the admin page (http://127.0.0.1:9110/admin) of a running jobrund
+    cmds:
+      - '{{if eq OS "windows"}}powershell -NoProfile -Command "Start-Process http://127.0.0.1:9110/admin"{{else}}xdg-open http://127.0.0.1:9110/admin || open http://127.0.0.1:9110/admin{{end}}'
 
   client:
     desc: "Run the jobrun CLI against a running jobrund (task client -- enqueue|get|list|cancel|retry|schedule ...)"
@@ -67,9 +73,9 @@ tasks:
       - go run ./cmd/jobrun -addr {{.GRPC_ADDR}} {{.CLI_ARGS}}
 
   bench:
-    desc: "Load test a running jobrund (task bench -- --rate 200 --duration 60s)"
+    desc: "Load test a running jobrund at the plan's target (override: task bench -- --rate 300 --direct)"
     cmds:
-      - go run ./cmd/jobrun -addr {{.GRPC_ADDR}} bench {{.CLI_ARGS}}
+      - go run ./cmd/jobrun -addr {{.GRPC_ADDR}} bench --rate 200 --duration 60s {{.CLI_ARGS}}
     env:
       DATABASE_URL: "{{.DATABASE_URL}}"
 

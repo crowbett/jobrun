@@ -301,6 +301,13 @@ Every step ends with `task fmt; go build ./...; go vet ./...` green plus the che
 - **`job_events` write amplification.** ~4 rows per job is ~700 rows/s at target. `JOB_EVENTS=terminal` roughly halves it and the reaper prunes; measure it during the bench before blaming the queue itself.
 - **Dead jobs are silent** unless someone looks: `jobrun_dead_total` goes on the dashboard with an alert rule, the same discipline as orders' `orders_dlq_total`.
 
+## Deviations recorded at integration (steps 11-12)
+- Teardown has **six** logged stages, not five: the ladder above folds "pool close" into the deferred calls; `cmd/jobrund` logs it as `5/6` and the OTel flush as `6/6` so Ctrl-Break shows every step.
+- `worker.Config` gained an optional `Durations DurationObserver` (called after every handler run, nil-safe) so `jobrun_job_duration_seconds` is fed without the worker importing `internal/admin`. `jobrun_lease_expired_total` reads `reaper.Stats().Reaped` (leases the reaper actually requeued or killed), not the pool's `LeaseLost`.
+- `cmd/jobrund` imports `time/tzdata`: Windows and distroless have no zoneinfo, and `America/New_York` was rejected on the first smoke run.
+- The bench's latency source is the job row (`finished_at - created_at` via paged `List`, both database-clock), not `job_events`: one page carries 200 jobs where events cost four rows per job. The `pg_stat_database` / `pg_stat_statements` deltas were not implemented; the criterion passed at defaults (200/s p99 9 ms; 1000/s direct p99 179 ms), so no knob tuning was needed.
+- `task run` sets `WORKER_QUEUES=default,bench` so the bench queue is consumed out of the box; the daemon default stays `default`.
+
 ## Open questions for the owner
 1. Cancel on a *leased* job: v1 sets `cancel_requested` and the heartbeat cancels the handler's context on the next tick, so the job ends `cancelled` rather than `dead`. Confirm, or make Cancel queued-only.
 2. Payload as `jsonb` (queryable, validated, ~2x storage) vs `bytea` (opaque, proto-friendly). The plan assumes `jsonb` with a `bytea` escape hatch later; the proto field is `bytes` either way.
