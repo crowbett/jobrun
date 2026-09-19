@@ -55,6 +55,7 @@ linters:
     generated: lax
     paths:
       - gen/ # protoc output
+      - internal/postgres/sqlc/ # sqlc output
     presets:
       - comments
       - std-error-handling
@@ -75,6 +76,7 @@ formatters:
   exclusions:
     paths:
       - gen/
+      - internal/postgres/sqlc/
 
 issues:
   max-issues-per-linter: 0
