@@ -75,7 +75,7 @@ func TestWithRequestID(t *testing.T) {
 }
 
 func TestUnaryChain(t *testing.T) {
-	t.Parallel()
+	// The subtests share buf, so they run sequentially on purpose.
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	info := &grpc.UnaryServerInfo{FullMethod: "/jobrun.v1.JobService/Enqueue"}
