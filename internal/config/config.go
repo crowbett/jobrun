@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -19,8 +20,13 @@ type Config struct {
 	Env         string // APP_ENV: dev | staging | prod
 	GRPCAddr    string // GRPC_ADDR, default ":50052"
 	AdminAddr   string // ADMIN_ADDR, default "127.0.0.1:9110"
-	DatabaseURL string // DATABASE_URL (required)
-	PGMaxConns  int    // PGX_MAX_CONNS, default Worker.Concurrency + 8
+	// AdminAllowRemote (ADMIN_ALLOW_REMOTE) permits an ADMIN_ADDR that is not
+	// a loopback address. The admin surface has no authentication, so
+	// Validate refuses a non-loopback bind unless this is set (a container
+	// behind its own network boundary sets it in the Dockerfile).
+	AdminAllowRemote bool
+	DatabaseURL      string // DATABASE_URL (required)
+	PGMaxConns       int    // PGX_MAX_CONNS, default Worker.Concurrency + 8
 
 	LogLevel  slog.Level // LOG_LEVEL
 	LogFormat string     // LOG_FORMAT: json | text
@@ -133,6 +139,9 @@ func Load() (Config, error) {
 	if cfg.OTel.Enabled, err = getBool("OTEL_ENABLED", false); err != nil {
 		return Config{}, err
 	}
+	if cfg.AdminAllowRemote, err = getBool("ADMIN_ALLOW_REMOTE", false); err != nil {
+		return Config{}, err
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -149,8 +158,11 @@ func (c Config) Validate() error {
 	if c.GRPCAddr == "" {
 		errs = append(errs, errors.New("GRPC_ADDR must not be empty"))
 	}
-	if c.AdminAddr == "" {
+	switch {
+	case c.AdminAddr == "":
 		errs = append(errs, errors.New("ADMIN_ADDR must not be empty"))
+	case !c.AdminAllowRemote && !IsLoopbackAddr(c.AdminAddr):
+		errs = append(errs, fmt.Errorf("ADMIN_ADDR %q is not a loopback address: the admin surface has no auth; bind 127.0.0.1 or set ADMIN_ALLOW_REMOTE=true", c.AdminAddr))
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be json or text, got %q", c.LogFormat))
@@ -198,6 +210,22 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED=true"))
 	}
 	return errors.Join(errs...)
+}
+
+// IsLoopbackAddr reports whether a host:port listen address binds only a
+// loopback interface: "127.0.0.1:9110", "[::1]:9110", "localhost:9110".
+// An empty or wildcard host (":9110", "0.0.0.0:9110", "[::]:9110") binds
+// every interface and is not loopback.
+func IsLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func splitList(s string) []string {

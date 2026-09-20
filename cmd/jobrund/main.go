@@ -52,6 +52,9 @@ const (
 	infraStopTimeout = 5 * time.Second  // stage 4: notifier connection, depth cache
 	otelFlushTimeout = 5 * time.Second  // stage 6
 	clockSkewWarn    = 2 * time.Second  // docs/PLAN.md, Risks: clock skew on run_at
+
+	maxRecvMsgSize       = 1 << 20 // gRPC request cap; payloads are capped at job.MaxPayloadBytes
+	maxConcurrentStreams = 256     // per connection; unary RPCs finish in milliseconds
 )
 
 // version is injected at build time: -ldflags="-X main.version=v1.2.3".
@@ -187,6 +190,11 @@ func run() error {
 		return fmt.Errorf("listen %s: %w", cfg.GRPCAddr, err)
 	}
 	grpcSrv := grpc.NewServer(
+		// job.MaxPayloadBytes (256 KiB) is the largest field a request carries;
+		// 1 MiB leaves room for the envelope and stops a client from making the
+		// server buffer the default 4 MiB per message.
+		grpc.MaxRecvMsgSize(maxRecvMsgSize),
+		grpc.MaxConcurrentStreams(maxConcurrentStreams),
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
 		grpc.ChainUnaryInterceptor(
 			interceptor.UnaryRecover(logger), // outermost: catches panics from everything below

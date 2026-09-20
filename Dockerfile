@@ -26,7 +26,11 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=builder /out/jobrund /jobrund
 
-ENV GRPC_ADDR=:50052 ADMIN_ADDR=:9110 LOG_FORMAT=json
+# ADMIN_ADDR binds every interface here so the page is reachable through
+# the container's published port; the admin surface has no auth, so
+# ADMIN_ALLOW_REMOTE=true is the explicit opt-in jobrund requires for that.
+# Publish 9110 only to loopback (-p 127.0.0.1:9110:9110) or not at all.
+ENV GRPC_ADDR=:50052 ADMIN_ADDR=:9110 ADMIN_ALLOW_REMOTE=true LOG_FORMAT=json
 EXPOSE 50052 9110
 USER nonroot:nonroot
 

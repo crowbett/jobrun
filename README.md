@@ -109,6 +109,7 @@ Reflection is on, so `grpcurl -plaintext localhost:50052 list` works too.
 | --- | --- | --- |
 | `DATABASE_URL` | required | `postgres://jobrun:jobrun@localhost:5434/jobrun?sslmode=disable` locally |
 | `GRPC_ADDR` / `ADMIN_ADDR` | `:50052` / `127.0.0.1:9110` | ports frozen in docs/PLAN.md |
+| `ADMIN_ALLOW_REMOTE` | `false` | the admin surface has no auth: a non-loopback `ADMIN_ADDR` is refused unless this is `true` (the Dockerfile sets it) |
 | `PGX_MAX_CONNS` | `WORKER_CONCURRENCY + 8` | must be >= concurrency + 2 |
 | `WORKER_QUEUES` | `default` | comma list; `task run` uses `default,bench` |
 | `WORKER_CONCURRENCY` / `WORKER_BATCH` | `16` / `32` | handler goroutines / jobs per claim |
@@ -125,6 +126,10 @@ Reflection is on, so `grpcurl -plaintext localhost:50052 list` works too.
 ## Admin, metrics, SSE
 
 `http://127.0.0.1:9110/admin` is the embedded page (depth table + live transition log).
+There is no authentication on any of these routes: `jobrund` refuses to start with an
+`ADMIN_ADDR` that is not loopback unless `ADMIN_ALLOW_REMOTE=true`, and the container image
+(which sets it) should publish 9110 to loopback only. `/admin/stats` and `/admin/events` are
+served with `Access-Control-Allow-Origin: *` so a local `file://` page can subscribe.
 `/admin/stats` is JSON (version, uptime, depth, pool counters, outcome tally); `/admin/events` is SSE
 (`event: snapshot` with the depth table on connect, then `event: job` per transition, keepalive
 comments while idle); `/metrics` is hand-written Prometheus text: `jobrun_queue_depth{queue,status}`
