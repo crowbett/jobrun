@@ -23,6 +23,11 @@ const requestIDKey ctxKey = iota
 // RequestIDHeader is the metadata key used to propagate request identifiers.
 const RequestIDHeader = "x-request-id"
 
+// MaxRequestIDLen bounds a client-supplied request id. Anything longer, or
+// not printable ASCII, is replaced with a generated id: the value is logged
+// and echoed back, so it must not be a vehicle for log injection or bloat.
+const MaxRequestIDLen = 128
+
 // RequestIDFrom returns the request id stored in ctx, or "".
 func RequestIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey).(string)
@@ -34,7 +39,7 @@ func RequestIDFrom(ctx context.Context) string {
 func withRequestID(ctx context.Context) context.Context {
 	var id string
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get(RequestIDHeader); len(v) > 0 {
+		if v := md.Get(RequestIDHeader); len(v) > 0 && validRequestID(v[0]) {
 			id = v[0]
 		}
 	}
@@ -44,6 +49,20 @@ func withRequestID(ctx context.Context) context.Context {
 	// Best effort: SetHeader only fails if headers were already sent.
 	_ = grpc.SetHeader(ctx, metadata.Pairs(RequestIDHeader, id))
 	return context.WithValue(ctx, requestIDKey, id)
+}
+
+// validRequestID accepts 1..MaxRequestIDLen bytes of printable ASCII
+// (0x21..0x7e: no spaces, no control characters, no non-ASCII).
+func validRequestID(id string) bool {
+	if id == "" || len(id) > MaxRequestIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; c < 0x21 || c > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func newRequestID() string {
