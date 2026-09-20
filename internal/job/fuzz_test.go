@@ -214,3 +214,40 @@ func FuzzScheduleValidate(f *testing.F) {
 		}
 	})
 }
+
+// FuzzPolicyJSON pins the backoff jsonb codec the store and the reaper read
+// back from the database: never panics, every decoded policy round-trips
+// through MarshalJSON, and Next after OrDefault is never negative for any
+// attempt count.
+func FuzzPolicyJSON(f *testing.F) {
+	for _, s := range []string{
+		"{}", `{"base":"1s","max":"5m","factor":2,"jitter":true}`, `{"base":"-1s"}`, `{"max":"0s"}`,
+		`{"factor":-2}`, `{"factor":1e308}`, `{"factor":0.5}`, `{"base":"nope"}`, `{"base":"9223372036854775807ns","max":"1ns"}`,
+		`[]`, `null`, `{"base":1}`, `{"jitter":"yes"}`, "",
+	} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		var p Policy
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return
+		}
+		out, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("Marshal(%+v) from %q: %v", p, raw, err)
+		}
+		var again Policy
+		if err := json.Unmarshal(out, &again); err != nil {
+			t.Fatalf("re-decode %s from %q: %v", out, raw, err)
+		}
+		if again != p {
+			t.Fatalf("round trip %q -> %+v -> %s -> %+v", raw, p, out, again)
+		}
+		d := p.OrDefault()
+		for _, attempt := range []int32{-1, 0, 1, 2, 10, 64, 1 << 30} {
+			if n := d.Next(attempt, nil); n < 0 {
+				t.Fatalf("Next(%d) = %s < 0 for %+v (from %q)", attempt, n, d, raw)
+			}
+		}
+	})
+}
