@@ -313,3 +313,29 @@ Every step ends with `task fmt; go build ./...; go vet ./...` green plus the che
 2. Payload as `jsonb` (queryable, validated, ~2x storage) vs `bytea` (opaque, proto-friendly). The plan assumes `jsonb` with a `bytea` escape hatch later; the proto field is `bytes` either way.
 3. Multi-tenant queues: is `queue` enough, or is a `tenant` column needed now? It is far cheaper before the indexes exist than after.
 4. Should the `jobrun` CLI also be able to embed the worker (`jobrun run --queues default`) so one binary covers both roles, or stay a pure client with `jobrund` as the only long-running process? The plan assumes the latter.
+
+## Hardening (2026-09-19)
+
+P16 pass over this repo: security review, fuzzing, coverage, CI. Commits `bfc31ad..` on `main`.
+
+**Vulnerabilities.** `govulncheck ./...`: no findings (reachable or otherwise). Nothing bumped.
+
+**Security fixes (each with a pinning test).**
+- Payloads that `encoding/json` accepts but `jsonb` rejects (`\u0000`, unpaired surrogate escapes, invalid UTF-8) surfaced as `Internal`; they are `InvalidArgument` now (`internal/job/validate.go`). Idempotency keys must be UTF-8 without control characters (a NUL cannot be stored in `text`).
+- A handler error containing a NUL, invalid UTF-8, or a multibyte rune straddling `MaxErrorLen` made `Store.Fail` itself fail, leaving the job leased until the reaper: `job.SanitizeError` now cleans the cause for both `last_error` and `job_events` (`TestFailStoresHostileCause`).
+- New caps: `Purge.limit <= 10 000` (one DELETE per call), `delay <= 10y`, `run_at` within 1970..9999 (the pgx timestamptz encoder overflows silently beyond that), `cron <= 256 B`, `timezone <= 64 B`.
+- `x-request-id` from the client is reused only when it is 1..128 bytes of printable ASCII (it is logged and echoed); anything else is replaced.
+- The admin surface (`/admin`, `/admin/events`, `/admin/stats`, `/metrics`) has no auth: `ADMIN_ADDR` must be loopback unless `ADMIN_ALLOW_REMOTE=true` (the Dockerfile sets it; publish 9110 to loopback only).
+- `jobrund` sets `grpc.MaxRecvMsgSize(1 MiB)` and `MaxConcurrentStreams(256)` explicitly.
+
+**Reviewed and accepted.** SQL is sqlc-only (no string-built SQL; `LISTEN` uses `pgx.Identifier.Sanitize`, `statement_timeout` is a bound parameter). NOTIFY payloads are only used as a map key. Error strings leaving gRPC are the sentinel messages or the fixed `internal error`; panics never reach the client. `http.Server` has `ReadHeaderTimeout` 5 s / `ReadTimeout` 10 s / `IdleTimeout` 2 m (no `WriteTimeout` by design for SSE). The admin page renders every value through `textContent`. Metrics labels are validated names. Database credentials are never logged (host/port/db only). `json.Valid` caps nesting at 10 000, which Postgres 17 parses under the default `max_stack_depth` (verified). No file writes, no subprocesses, no outbound fetches except the operator-configured OTLP endpoint. `time.LoadLocation` rejects `..` and absolute paths but does hit the filesystem per bogus timezone (bounded to 64 bytes; ~3 ms per call on the fuzz box).
+
+**Fuzz targets (each run 60 s, 0 crashers).** `cronx.FuzzParse` 10.6 M execs; `job.FuzzNewJobValidate` 2.9 M (payload + key); `job.FuzzValidateName` 7.6 M; `job.FuzzDecodeCursor` 3.8 M; `job.FuzzSanitizeError` 1.5 M; `job.FuzzScheduleValidate` 17 k (LoadLocation is I/O bound); `job.FuzzPolicyJSON` 4.9 M (the backoff jsonb the reaper reads back); `server.FuzzDecodeNameToken` 0.7 M. Seed corpora live in the tests; no `testdata/fuzz` was needed.
+
+**Coverage (core packages, before -> after; `-tags integration` for the store).** cronx 100 -> 100, postgres 81.9 -> 82.0, worker 94.2 -> 94.5, scheduler 83.0 -> 83.0, reaper 91.5 -> 91.5, server 96.2 -> 96.2, admin 95.0 -> 95.0, job 95.9 -> 97.2. Non-core but touched: config 79.8 -> 89.0, interceptor 0 -> 98.3 (first tests). Every core package is above the 80 % bar.
+
+**CI.** Was green before the pass (run 35441078536); the Linux side was verified in `golang:1.27` before pushing (it caught a request-id spelling in the bufconn tests that Windows had not run yet). No golden files on disk, race step already runs under `shell: bash`.
+
+**goreleaser.** Not applicable: jobrun is a daemon plus a client CLI shipped as a container image; it is not on the P16 CLI list.
+
+**Open.** `/admin/stats` and `/admin/events` send `Access-Control-Allow-Origin: *` so a `file://` page can subscribe; on a loopback bind that still lets any site open in the operator's browser read queue names, types and job error strings. Dropping the header (the embedded page is same-origin) is a one-line change but a documented design choice, so it is left for the owner.
