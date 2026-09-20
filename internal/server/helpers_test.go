@@ -318,7 +318,7 @@ func scheduleErrCases() []errCase {
 
 // checkStatus asserts the code and, for Internal, that the real error did not
 // leak into the status message but did reach the log with the request id.
-func checkStatus(t *testing.T, err error, want codes.Code, logs *syncBuffer, requestID string) {
+func checkStatus(t *testing.T, err error, want codes.Code, logs *syncBuffer, id string) {
 	t.Helper()
 	if got := status.Code(err); got != want {
 		t.Fatalf("code = %v, want %v (err %v)", got, want, err)
@@ -334,18 +334,23 @@ func checkStatus(t *testing.T, err error, want codes.Code, logs *syncBuffer, req
 		t.Errorf("internal message leaks the cause: %q", msg)
 	}
 	out := logs.String()
-	if !strings.Contains(out, requestID) {
-		t.Errorf("log does not carry request id %q:\n%s", requestID, out)
+	if !strings.Contains(out, requestID(id)) {
+		t.Errorf("log does not carry request id %q:\n%s", requestID(id), out)
 	}
 	if !strings.Contains(out, "db-secret-host") {
 		t.Errorf("log does not carry the real error:\n%s", out)
 	}
 }
 
+// ctxWithRequestID sends id as x-request-id. Subtest names carry spaces,
+// which the interceptor rejects (printable ASCII only), so they become
+// dashes; checkStatus looks for the same spelling.
 func ctxWithRequestID(t *testing.T, id string) context.Context {
 	t.Helper()
-	return metadata.AppendToOutgoingContext(t.Context(), interceptor.RequestIDHeader, id)
+	return metadata.AppendToOutgoingContext(t.Context(), interceptor.RequestIDHeader, requestID(id))
 }
+
+func requestID(id string) string { return strings.ReplaceAll(id, " ", "-") }
 
 func checkJob(t *testing.T, got *jobrunv1.Job, want job.Job) {
 	t.Helper()
