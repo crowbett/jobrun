@@ -124,10 +124,7 @@ func (s *Store) PruneEvents(ctx context.Context, olderThan time.Duration) (int64
 	return n, nil
 }
 
-// truncateErr bounds an error string to job.MaxErrorLen bytes.
-func truncateErr(s string) string {
-	if len(s) <= job.MaxErrorLen {
-		return s
-	}
-	return s[:job.MaxErrorLen]
-}
+// truncateErr bounds an error string for a text column: job.MaxErrorLen bytes
+// cut on a rune boundary, invalid UTF-8 replaced, NUL dropped (Postgres
+// rejects both, and a rejected Fail would leave the job leased until reaped).
+func truncateErr(s string) string { return job.SanitizeError(s) }

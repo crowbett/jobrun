@@ -285,8 +285,8 @@ func (p *Pool) handle(ctx context.Context, j job.Job) (commit job.Commit, err er
 	}
 }
 
-// cause names why the attempt failed for last_error / the event, bounded to
-// job.MaxErrorLen.
+// cause names why the attempt failed for last_error / the event, bounded and
+// cleaned by job.SanitizeError.
 func (p *Pool) cause(jctx context.Context, id job.ID, err error) string {
 	var s string
 	switch {
@@ -297,10 +297,7 @@ func (p *Pool) cause(jctx context.Context, id job.ID, err error) string {
 	default:
 		s = err.Error()
 	}
-	if len(s) > job.MaxErrorLen {
-		s = s[:job.MaxErrorLen]
-	}
-	return s
+	return job.SanitizeError(s)
 }
 
 func (p *Pool) storeError(log *slog.Logger, op string, err error) {

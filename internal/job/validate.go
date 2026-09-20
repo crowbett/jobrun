@@ -3,7 +3,9 @@ package job
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Validation limits. The server enforces them before anything reaches the store.
@@ -28,6 +30,19 @@ const (
 	MaxListLimit = 200
 	// MaxErrorLen bounds LastError / Event.Err as stored.
 	MaxErrorLen = 4096
+	// MaxPurgeLimit caps PurgeQuery.Limit: one Purge is one transaction and
+	// one DELETE, so a client cannot ask for millions of rows in a single call.
+	MaxPurgeLimit = 10_000
+	// MaxDelay caps NewJob.Delay (ten years). An absolute RunAt is bounded to
+	// the Unix epoch .. MaxRunAtYear: far outside that range the pgx
+	// timestamptz encoder overflows silently and Postgres rejects the value.
+	MaxDelay = 10 * 365 * 24 * time.Hour
+	// MaxRunAtYear is the last calendar year an absolute RunAt may fall in.
+	MaxRunAtYear = 9999
+	// MaxCronLen bounds Schedule.Cron on the wire.
+	MaxCronLen = 256
+	// MaxTimezoneLen bounds Schedule.Timezone (the longest IANA name is 32).
+	MaxTimezoneLen = 64
 )
 
 // ValidateName checks a queue, type or schedule name: 1..MaxNameLen characters
@@ -74,23 +89,136 @@ func (n NewJob) Validate() error {
 	if n.MaxAttempts < 0 || n.MaxAttempts > MaxAttemptsLimit {
 		return fmt.Errorf("%w: max_attempts must be in 1..%d (0 = default %d)", ErrInvalidArgument, MaxAttemptsLimit, DefaultMaxAttempts)
 	}
+	if n.Delay > MaxDelay {
+		return fmt.Errorf("%w: delay must be at most %s", ErrInvalidArgument, MaxDelay)
+	}
+	if !n.RunAt.IsZero() && (n.RunAt.Unix() < 0 || n.RunAt.Year() > MaxRunAtYear) {
+		return fmt.Errorf("%w: run_at must be between 1970 and %d", ErrInvalidArgument, MaxRunAtYear)
+	}
 	if err := n.Backoff.Validate(); err != nil {
 		return err
 	}
-	if len(n.IdempotencyKey) > MaxIdempotencyKeyLen {
+	return ValidateIdempotencyKey(n.IdempotencyKey)
+}
+
+// ValidateIdempotencyKey checks an optional key: at most MaxIdempotencyKeyLen
+// bytes of valid UTF-8 with no control characters (a NUL byte cannot be stored
+// in a Postgres text column at all).
+func ValidateIdempotencyKey(key string) error {
+	if len(key) > MaxIdempotencyKeyLen {
 		return fmt.Errorf("%w: idempotency_key must be at most %d characters", ErrInvalidArgument, MaxIdempotencyKeyLen)
+	}
+	if !utf8.ValidString(key) {
+		return fmt.Errorf("%w: idempotency_key must be valid UTF-8", ErrInvalidArgument)
+	}
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("%w: idempotency_key must not contain control characters (0x%02x at %d)", ErrInvalidArgument, c, i)
+		}
 	}
 	return nil
 }
 
+// validatePayload checks the size and that the bytes are a JSON document
+// Postgres jsonb accepts: valid UTF-8 and no \u0000 or unpaired-surrogate
+// escapes. encoding/json tolerates both; jsonb rejects them, which would
+// otherwise surface as an internal error instead of an invalid argument.
 func validatePayload(p []byte) error {
 	if len(p) > MaxPayloadBytes {
 		return fmt.Errorf("%w: payload must be at most %d bytes, got %d", ErrInvalidArgument, MaxPayloadBytes, len(p))
 	}
-	if len(p) > 0 && !json.Valid(p) {
+	if len(p) == 0 {
+		return nil
+	}
+	if !utf8.Valid(p) {
+		return fmt.Errorf("%w: payload must be valid UTF-8", ErrInvalidArgument)
+	}
+	if !json.Valid(p) {
 		return fmt.Errorf("%w: payload must be valid JSON", ErrInvalidArgument)
 	}
+	if err := checkJSONEscapes(p); err != nil {
+		return fmt.Errorf("%w: payload: %w", ErrInvalidArgument, err)
+	}
 	return nil
+}
+
+// checkJSONEscapes walks the \u escapes of an already-valid JSON document and
+// rejects \u0000 and surrogate halves that do not form a pair. In valid JSON a
+// backslash only appears inside a string as the start of an escape, so
+// skipping two bytes per backslash is exact.
+func checkJSONEscapes(p []byte) error {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '\\' {
+			continue
+		}
+		if i+1 >= len(p) || p[i+1] != 'u' {
+			i++ // any other escape is two bytes
+			continue
+		}
+		cp, ok := hex4(p, i+2)
+		if !ok {
+			return fmt.Errorf("bad \\u escape at %d", i)
+		}
+		switch {
+		case cp == 0:
+			return fmt.Errorf("\\u0000 at %d cannot be stored", i)
+		case cp >= 0xD800 && cp <= 0xDBFF:
+			lo, ok := hex4(p, i+8)
+			if !ok || p[i+6] != '\\' || p[i+7] != 'u' || lo < 0xDC00 || lo > 0xDFFF {
+				return fmt.Errorf("unpaired high surrogate at %d", i)
+			}
+			i += 11 // \uXXXX\uXXXX
+		case cp >= 0xDC00 && cp <= 0xDFFF:
+			return fmt.Errorf("unpaired low surrogate at %d", i)
+		default:
+			i += 5 // \uXXXX
+		}
+	}
+	return nil
+}
+
+// hex4 decodes four hex digits at p[i:i+4].
+func hex4(p []byte, i int) (int, bool) {
+	if i < 0 || i+4 > len(p) {
+		return 0, false
+	}
+	var v int
+	for _, c := range p[i : i+4] {
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, true
+}
+
+// SanitizeError bounds a handler error message for last_error / Event.Err: at
+// most MaxErrorLen bytes cut on a rune boundary, invalid UTF-8 replaced and
+// NUL bytes dropped (Postgres text rejects both), so a failing job can always
+// be recorded as failed rather than failing the Fail call itself.
+func SanitizeError(s string) string {
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, string(utf8.RuneError))
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, string([]byte{0}), "")
+	}
+	if len(s) > MaxErrorLen {
+		cut := MaxErrorLen
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		s = s[:cut]
+	}
+	return s
 }
 
 // Validate checks the filters and normalises Limit: 0 becomes DefaultListLimit,
@@ -138,8 +266,8 @@ func (q *PurgeQuery) Validate() error {
 	if q.OlderThan < 0 {
 		return fmt.Errorf("%w: older_than must not be negative", ErrInvalidArgument)
 	}
-	if q.Limit < 0 {
-		return fmt.Errorf("%w: limit must not be negative", ErrInvalidArgument)
+	if q.Limit < 0 || q.Limit > MaxPurgeLimit {
+		return fmt.Errorf("%w: limit must be in 0..%d", ErrInvalidArgument, MaxPurgeLimit)
 	}
 	return nil
 }
@@ -153,6 +281,12 @@ func (s Schedule) Validate() error {
 	}
 	if s.Cron == "" {
 		return fmt.Errorf("%w: cron must not be empty", ErrInvalidArgument)
+	}
+	if len(s.Cron) > MaxCronLen {
+		return fmt.Errorf("%w: cron must be at most %d characters", ErrInvalidArgument, MaxCronLen)
+	}
+	if len(s.Timezone) > MaxTimezoneLen {
+		return fmt.Errorf("%w: timezone must be at most %d characters", ErrInvalidArgument, MaxTimezoneLen)
 	}
 	if s.Timezone != "" {
 		if _, err := time.LoadLocation(s.Timezone); err != nil {

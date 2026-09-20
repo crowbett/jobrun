@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -613,6 +614,38 @@ func TestFailRetriesThenDead(t *testing.T) {
 	}
 	if _, err := s.Fail(ctx, p.ID, "w1", "again", false, dbNow(t, s)); !errors.Is(err, job.ErrLeaseLost) {
 		t.Fatalf("Fail on a dead job: want ErrLeaseLost got %v", err)
+	}
+}
+
+// TestFailStoresHostileCause pins that a handler error Postgres text cannot
+// hold (a NUL byte, invalid UTF-8, a multibyte rune straddling MaxErrorLen)
+// still records the failure instead of failing Fail and leaving the job leased.
+func TestFailStoresHostileCause(t *testing.T) {
+	t.Parallel()
+	s, _ := newStore(t)
+	ctx := context.Background()
+	causes := []struct {
+		name, cause, want string
+	}{
+		{"nul", "boom\x00 hidden", "boom hidden"},
+		{"invalid utf-8", "bad \xff byte", "bad � byte"},
+		{"rune straddles cap", strings.Repeat("a", job.MaxErrorLen-1) + "é", strings.Repeat("a", job.MaxErrorLen-1)},
+	}
+	for _, tc := range causes {
+		j := mustEnqueue(t, s, newJob(t, "hostile", func(n *job.NewJob) { n.MaxAttempts = 1 }))
+		mustClaim(t, s, "hostile", "w1", 1, time.Minute)
+		st, err := s.Fail(ctx, j.ID, "w1", tc.cause, false, dbNow(t, s))
+		if err != nil || st != job.StatusDead {
+			t.Fatalf("%s: Fail: %v / %v", tc.name, st, err)
+		}
+		got := mustGet(t, s, j.ID)
+		if got.LastError != tc.want {
+			t.Fatalf("%s: last_error %q, want %q", tc.name, got.LastError, tc.want)
+		}
+		evs, err := s.Events(ctx, j.ID)
+		if err != nil || len(evs) == 0 || evs[len(evs)-1].Err != tc.want {
+			t.Fatalf("%s: events %v: %v", tc.name, eventStatuses(evs), err)
+		}
 	}
 }
 
