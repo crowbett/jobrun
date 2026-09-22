@@ -95,7 +95,7 @@ func TestEventsSnapshotThenStream(t *testing.T) {
 		"Content-Type":                "text/event-stream",
 		"Cache-Control":               "no-cache",
 		"X-Accel-Buffering":           "no",
-		"Access-Control-Allow-Origin": "*",
+		"Access-Control-Allow-Origin": "",
 	} {
 		if got := c.resp.Header.Get(k); got != want {
 			t.Errorf("header %s = %q, want %q", k, got, want)

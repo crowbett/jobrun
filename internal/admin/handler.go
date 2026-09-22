@@ -28,7 +28,12 @@ type Deps struct {
 	StartedAt time.Time
 	// Pool returns worker.Pool.Stats() for /admin/stats.
 	Pool func() any
-	Log  *slog.Logger
+	// AllowedOrigins (ADMIN_CORS_ORIGINS) are the cross-origin pages allowed
+	// to read /admin/stats and /admin/events. Empty (the default) sends no
+	// Access-Control-Allow-Origin at all: only the same-origin /admin page
+	// can read them.
+	AllowedOrigins []string
+	Log            *slog.Logger
 }
 
 // Handler mounts the admin surface on a fresh mux:
@@ -59,10 +64,10 @@ func Handler(d Deps) http.Handler {
 		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFileFS(w, r, web.Admin, "admin.html")
 	})
-	mux.Handle("GET /admin/events", Events(d.Broker, snapshot))
-	mux.Handle("GET /admin/stats", Stats(StatsDeps{
+	mux.Handle("GET /admin/events", allowOrigins(d.AllowedOrigins, Events(d.Broker, snapshot)))
+	mux.Handle("GET /admin/stats", allowOrigins(d.AllowedOrigins, Stats(StatsDeps{
 		Depth: d.Depth, Broker: d.Broker, Version: d.Version, StartedAt: d.StartedAt, Pool: d.Pool, Counters: d.Counters,
-	}))
+	})))
 	mux.Handle("GET /metrics", Metrics(d.Depth, d.Counters, d.Durations, d.Build))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

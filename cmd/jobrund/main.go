@@ -222,15 +222,16 @@ func run() error {
 
 	// --- Admin http ---------------------------------------------------------------
 	adminSrv := admin.NewServer(cfg.AdminAddr, admin.Deps{
-		Broker:    broker,
-		Depth:     depth,
-		Counters:  counters,
-		Durations: hist,
-		Build:     map[string]string{"version": version, "go_version": runtime.Version(), "env": cfg.Env},
-		Version:   version,
-		StartedAt: startedAt,
-		Pool:      func() any { return wp.Stats() },
-		Log:       logger,
+		Broker:         broker,
+		Depth:          depth,
+		Counters:       counters,
+		Durations:      hist,
+		Build:          map[string]string{"version": version, "go_version": runtime.Version(), "env": cfg.Env},
+		Version:        version,
+		StartedAt:      startedAt,
+		Pool:           func() any { return wp.Stats() },
+		AllowedOrigins: cfg.AdminCORSOrigins,
+		Log:            logger,
 	})
 
 	// --- Background goroutines ------------------------------------------------------

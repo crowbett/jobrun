@@ -45,7 +45,8 @@ type jobCount struct {
 }
 
 // Stats serves a JSON summary: version, uptime, the cached depth table, SSE
-// subscriber/drop counts, the outcome counters and the pool stats.
+// subscriber/drop counts, the outcome counters and the pool stats. It sends
+// no CORS headers itself; Handler wraps it in the shared origin allowlist.
 func Stats(d StatsDeps) http.Handler {
 	return statsHandler{d: d, now: time.Now}
 }
@@ -88,7 +89,6 @@ func (h statsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	_ = json.NewEncoder(w).Encode(out)
 }
 

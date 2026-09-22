@@ -22,11 +22,10 @@ const (
 
 // streamHeaders are set on every successful SSE response.
 var streamHeaders = map[string]string{
-	"Content-Type":                "text/event-stream",
-	"Cache-Control":               "no-cache",
-	"Connection":                  "keep-alive",
-	"X-Accel-Buffering":           "no",
-	"Access-Control-Allow-Origin": "*",
+	"Content-Type":      "text/event-stream",
+	"Cache-Control":     "no-cache",
+	"Connection":        "keep-alive",
+	"X-Accel-Buffering": "no",
 }
 
 // eventJSON is the wire shape of a transition on the feed (job.Event has no
@@ -65,8 +64,8 @@ func depthsJSON(rows []job.DepthRow) []depthJSON {
 
 // Events streams job transitions from b as Server-Sent Events: one
 // `event: snapshot` (the depth table from snapshot) on connect, then
-// `event: job` per transition, with a keepalive comment while idle. Responses
-// carry Access-Control-Allow-Origin: * so a file:// page can subscribe.
+// `event: job` per transition, with a keepalive comment while idle. It sends
+// no CORS headers itself; Handler wraps it in the shared origin allowlist.
 //
 // The handler holds the connection open for as long as the client stays, so
 // it MUST be mounted outside any http.TimeoutHandler (whose ResponseWriter

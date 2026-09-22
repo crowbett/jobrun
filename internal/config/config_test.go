@@ -18,6 +18,9 @@ func TestLoadDefaults(t *testing.T) {
 	if len(cfg.Worker.Queues) != 1 || cfg.Worker.Queues[0] != "default" || cfg.Worker.Concurrency != 16 {
 		t.Errorf("worker defaults: %+v", cfg.Worker)
 	}
+	if len(cfg.AdminCORSOrigins) != 0 {
+		t.Errorf("AdminCORSOrigins default = %q, want empty", cfg.AdminCORSOrigins)
+	}
 	if cfg.PGMaxConns != 24 || !cfg.Scheduler.Enabled || cfg.Reaper.Retention != 168*time.Hour {
 		t.Errorf("derived defaults: pg=%d sched=%+v reaper=%+v", cfg.PGMaxConns, cfg.Scheduler, cfg.Reaper)
 	}
@@ -64,6 +67,19 @@ func TestLoadTable(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "admin cors allowlist",
+			env:  map[string]string{"ADMIN_CORS_ORIGINS": "http://localhost:3000, https://ops.example.com"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if len(c.AdminCORSOrigins) != 2 || c.AdminCORSOrigins[0] != "http://localhost:3000" || c.AdminCORSOrigins[1] != "https://ops.example.com" {
+					t.Errorf("AdminCORSOrigins = %q", c.AdminCORSOrigins)
+				}
+			},
+		},
+		{name: "admin cors wildcard refused", env: map[string]string{"ADMIN_CORS_ORIGINS": "*"}, wantErr: "ADMIN_CORS_ORIGINS"},
+		{name: "admin cors null refused", env: map[string]string{"ADMIN_CORS_ORIGINS": "null"}, wantErr: "ADMIN_CORS_ORIGINS"},
+		{name: "admin cors path refused", env: map[string]string{"ADMIN_CORS_ORIGINS": "http://localhost:3000/admin"}, wantErr: "ADMIN_CORS_ORIGINS"},
 		{name: "bad admin opt-in", env: map[string]string{"ADMIN_ALLOW_REMOTE": "maybe"}, wantErr: "ADMIN_ALLOW_REMOTE"},
 		{name: "bad scheduler bool", env: map[string]string{"SCHEDULER_ENABLED": "sometimes"}, wantErr: "SCHEDULER_ENABLED"},
 		{name: "bad log level", env: map[string]string{"LOG_LEVEL": "loud"}, wantErr: "LOG_LEVEL"},
@@ -91,6 +107,38 @@ func TestLoadTable(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("err = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsOrigin(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"http://localhost:3000", true},
+		{"https://ops.example.com", true},
+		{"http://127.0.0.1:9110/", true},
+		{"http://[::1]:8080", true},
+		{"*", false},
+		{"null", false},
+		{"", false},
+		{"localhost:3000", false},
+		{"file:///tmp/x.html", false},
+		{"ftp://example.com", false},
+		{"http://example.com/path", false},
+		{"http://example.com?q=1", false},
+		{"http://example.com#f", false},
+		{"http://user@example.com", false},
+		{"http://:8080", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			if got := IsOrigin(tc.in); got != tc.want {
+				t.Errorf("IsOrigin(%q) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}

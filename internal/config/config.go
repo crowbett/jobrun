@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -25,6 +26,12 @@ type Config struct {
 	// Validate refuses a non-loopback bind unless this is set (a container
 	// behind its own network boundary sets it in the Dockerfile).
 	AdminAllowRemote bool
+	// AdminCORSOrigins (ADMIN_CORS_ORIGINS, comma list, default empty) are the
+	// exact origins ("http://localhost:3000") whose pages may read
+	// /admin/stats and /admin/events cross-origin. Empty sends no
+	// Access-Control-Allow-Origin at all; the embedded /admin page is
+	// same-origin and needs none. "*" and "null" are refused.
+	AdminCORSOrigins []string
 	DatabaseURL      string // DATABASE_URL (required)
 	PGMaxConns       int    // PGX_MAX_CONNS, default Worker.Concurrency + 8
 
@@ -73,13 +80,14 @@ type OTel struct {
 // Load reads the environment and validates the result.
 func Load() (Config, error) {
 	cfg := Config{
-		ServiceName: getenv("SERVICE_NAME", "jobrun"),
-		Env:         getenv("APP_ENV", "dev"),
-		GRPCAddr:    getenv("GRPC_ADDR", ":50052"),
-		AdminAddr:   getenv("ADMIN_ADDR", "127.0.0.1:9110"),
-		DatabaseURL: os.Getenv("DATABASE_URL"),
-		LogFormat:   strings.ToLower(getenv("LOG_FORMAT", "json")),
-		StopTimeout: 15 * time.Second,
+		ServiceName:      getenv("SERVICE_NAME", "jobrun"),
+		Env:              getenv("APP_ENV", "dev"),
+		GRPCAddr:         getenv("GRPC_ADDR", ":50052"),
+		AdminAddr:        getenv("ADMIN_ADDR", "127.0.0.1:9110"),
+		AdminCORSOrigins: splitList(os.Getenv("ADMIN_CORS_ORIGINS")),
+		DatabaseURL:      os.Getenv("DATABASE_URL"),
+		LogFormat:        strings.ToLower(getenv("LOG_FORMAT", "json")),
+		StopTimeout:      15 * time.Second,
 		Worker: Worker{
 			Queues: splitList(getenv("WORKER_QUEUES", "default")), Concurrency: 16, BatchSize: 32,
 			LeaseTTL: 30 * time.Second, HeartbeatEvery: 10 * time.Second, JobTimeout: 10 * time.Minute,
@@ -164,6 +172,11 @@ func (c Config) Validate() error {
 	case !c.AdminAllowRemote && !IsLoopbackAddr(c.AdminAddr):
 		errs = append(errs, fmt.Errorf("ADMIN_ADDR %q is not a loopback address: the admin surface has no auth; bind 127.0.0.1 or set ADMIN_ALLOW_REMOTE=true", c.AdminAddr))
 	}
+	for _, o := range c.AdminCORSOrigins {
+		if !IsOrigin(o) {
+			errs = append(errs, fmt.Errorf("ADMIN_CORS_ORIGINS: %q is not an origin (want scheme://host[:port], http or https; \"*\" and \"null\" are refused)", o))
+		}
+	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		errs = append(errs, fmt.Errorf("LOG_FORMAT must be json or text, got %q", c.LogFormat))
 	}
@@ -226,6 +239,20 @@ func IsLoopbackAddr(addr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// IsOrigin reports whether s is a serialized web origin an allowlist may
+// name: http or https, a host, an optional port, and nothing else (no path,
+// query, fragment or userinfo). "*" and "null" are not origins here.
+func IsOrigin(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	return u.User == nil && (u.Path == "" || u.Path == "/") && u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && u.Opaque == ""
 }
 
 func splitList(s string) []string {
