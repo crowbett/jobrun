@@ -8,8 +8,8 @@ import "google/protobuf/timestamp.proto";
 option go_package = "github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1";
 
 // JobService is the control plane of the queue: enqueue, inspect and steer jobs.
-// Workers are in-process handlers inside jobrund (see docs/PLAN.md, Decision 3);
-// this service never leases work to a remote process.
+// Workers run in-process inside jobrund (docs/PLAN.md, Decision 3) or out of
+// process over WorkerService; this service never leases work itself.
 //
 // Status codes: INVALID_ARGUMENT (validation, bad cron, bad page_token),
 // NOT_FOUND, FAILED_PRECONDITION (not cancellable / not retryable),
@@ -51,17 +51,40 @@ service ScheduleService {
   rpc ListSchedules(ListSchedulesRequest) returns (ListSchedulesResponse) {}
 }
 
-// NOT in v1: a worker protocol for out-of-process workers. Reserved here so the
-// package has room for it without renumbering anything. It would pair with a
-// push Dispatcher (docs/PLAN.md, Decision 2) and degrade exactly-once effects to
-// effectively-once, which is why it is not implemented.
+// WorkerService leases work to out-of-process workers (docs/PLAN.md, ADR-0002).
 //
-// service WorkerService {
-//   rpc Lease(stream LeaseRequest) returns (stream LeaseResponse) {}
-//   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
-//   rpc Complete(CompleteRequest) returns (CompleteResponse) {}
-//   rpc Fail(FailRequest) returns (FailResponse) {}
-// }
+// A remote worker opens one Claim stream, grants credits (how many more jobs it
+// can run right now) and receives leased jobs, each with a lease fencing token.
+// It then heartbeats, completes or fails every job with (job_id, lease_token)
+// over the unary RPCs. A stale token (the lease expired and was reaped, or the
+// job was claimed again) is rejected, so a worker that lost its lease can never
+// finish the job.
+//
+// Remote workers get at-least-once execution and at-least-once effects: the
+// handler's side effect cannot commit in the same transaction as the job row
+// (job.TxHandler exactly-once is in-process only).
+//
+// Status codes: INVALID_ARGUMENT (bad worker id, queue, job id or token),
+// FAILED_PRECONDITION (the lease is no longer held: expired, reaped, stolen),
+// NOT_FOUND, INTERNAL otherwise.
+service WorkerService {
+  // Claim is the lease stream. The first request must carry worker_id and
+  // queues; every request (the first included) adds credits. The server pushes
+  // at most as many jobs as the worker has granted credits and never more than
+  // it can run. Closing the stream does not release leases already delivered:
+  // the worker keeps heartbeating them, or they expire and the reaper requeues.
+  rpc Claim(stream ClaimRequest) returns (stream ClaimResponse) {}
+  // Heartbeat extends the leases still held by the worker and reports which
+  // ones were lost (the worker must cancel those handlers and never finish them)
+  // and which ones had a cancel requested (stop, then Fail or Complete).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+  // Complete marks a leased job succeeded (or cancelled when a cancel was
+  // requested meanwhile). FAILED_PRECONDITION when the lease is not held.
+  rpc Complete(CompleteRequest) returns (CompleteResponse) {}
+  // Fail records an attempt failure; the server applies the job's backoff
+  // policy (retry, or dead when permanent / attempts exhausted).
+  rpc Fail(FailRequest) returns (FailResponse) {}
+}
 
 // JobStatus is the job lifecycle.
 //
@@ -117,6 +140,9 @@ message Job {
   google.protobuf.Timestamp finished_at = 18;
   // cancel_requested is set by Cancel on a LEASED job until the worker gives it up.
   bool cancel_requested = 19;
+  // traceparent is the W3C trace context captured at enqueue (empty when the
+  // producer was not traced); the run span is its child.
+  string traceparent = 20;
 }
 
 // JobEvent is one row of the append-only transition history of a job.
@@ -310,4 +336,86 @@ message ListSchedulesRequest {
 message ListSchedulesResponse {
   repeated Schedule schedules = 1;
   string next_page_token = 2;
+}
+
+// Lease names one claim of one job: the fencing token is bumped on every claim,
+// so a lease from an earlier attempt can never heartbeat, complete or fail the
+// job again.
+message Lease {
+  string job_id = 1;
+  int64 token = 2;
+}
+
+// LeasedJob is one job pushed down a Claim stream.
+message LeasedJob {
+  Job job = 1;
+  // lease_token is the fencing token of this claim (see Lease).
+  int64 lease_token = 2;
+  // lease_ttl is how long the lease lasts from the claim and from every
+  // successful heartbeat; heartbeat at most every lease_ttl/3.
+  google.protobuf.Duration lease_ttl = 3;
+  // traceparent is the W3C trace context stored when the job was enqueued;
+  // empty when the producer was not traced. The worker starts its run span as
+  // a child of it.
+  string traceparent = 4;
+}
+
+message ClaimRequest {
+  // worker_id identifies the worker process (1..128 printable ASCII, no
+  // spaces); required on the first message, ignored afterwards.
+  string worker_id = 1;
+  // queues to claim from; required on the first message, ignored afterwards.
+  repeated string queues = 2;
+  // credits is how many more jobs the worker can take (0..1024 per message).
+  int32 credits = 3;
+}
+
+message ClaimResponse {
+  LeasedJob job = 1;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated Lease leases = 2;
+}
+
+message HeartbeatResponse {
+  // Verdicts name leases, not job ids: a worker may hold an old and a new
+  // lease of the same job at once (it reclaimed its own reaped job).
+  //
+  // kept are the leases that were extended.
+  repeated Lease kept = 1;
+  // cancel_requested are held and extended too, but the job was cancelled:
+  // stop the handler, then Fail (or Complete) to record it.
+  repeated Lease cancel_requested = 2;
+  // lost are the leases that are gone: cancel the handler and never Complete
+  // or Fail it.
+  repeated Lease lost = 3;
+  google.protobuf.Duration lease_ttl = 4;
+}
+
+message CompleteRequest {
+  string worker_id = 1;
+  Lease lease = 2;
+  // traceparent of the worker's run span; the server's complete span is its child.
+  string traceparent = 3;
+}
+
+message CompleteResponse {
+  JobStatus status = 1;
+}
+
+message FailRequest {
+  string worker_id = 1;
+  Lease lease = 2;
+  // error is stored as last_error (sanitised and truncated server side).
+  string error = 3;
+  // permanent skips retries: the job goes straight to dead.
+  bool permanent = 4;
+  string traceparent = 5;
+}
+
+message FailResponse {
+  // status is QUEUED (will retry), DEAD or CANCELLED.
+  JobStatus status = 1;
 }

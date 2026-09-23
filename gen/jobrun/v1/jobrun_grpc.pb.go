@@ -33,8 +33,8 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // JobService is the control plane of the queue: enqueue, inspect and steer jobs.
-// Workers are in-process handlers inside jobrund (see docs/PLAN.md, Decision 3);
-// this service never leases work to a remote process.
+// Workers run in-process inside jobrund (docs/PLAN.md, Decision 3) or out of
+// process over WorkerService; this service never leases work itself.
 //
 // Status codes: INVALID_ARGUMENT (validation, bad cron, bad page_token),
 // NOT_FOUND, FAILED_PRECONDITION (not cancellable / not retryable),
@@ -143,8 +143,8 @@ func (c *jobServiceClient) Stats(ctx context.Context, in *StatsRequest, opts ...
 // for forward compatibility.
 //
 // JobService is the control plane of the queue: enqueue, inspect and steer jobs.
-// Workers are in-process handlers inside jobrund (see docs/PLAN.md, Decision 3);
-// this service never leases work to a remote process.
+// Workers run in-process inside jobrund (docs/PLAN.md, Decision 3) or out of
+// process over WorkerService; this service never leases work itself.
 //
 // Status codes: INVALID_ARGUMENT (validation, bad cron, bad page_token),
 // NOT_FOUND, FAILED_PRECONDITION (not cancellable / not retryable),
@@ -655,5 +655,274 @@ var ScheduleService_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
+	Metadata: "jobrun/v1/jobrun.proto",
+}
+
+const (
+	WorkerService_Claim_FullMethodName     = "/jobrun.v1.WorkerService/Claim"
+	WorkerService_Heartbeat_FullMethodName = "/jobrun.v1.WorkerService/Heartbeat"
+	WorkerService_Complete_FullMethodName  = "/jobrun.v1.WorkerService/Complete"
+	WorkerService_Fail_FullMethodName      = "/jobrun.v1.WorkerService/Fail"
+)
+
+// WorkerServiceClient is the client API for WorkerService service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// WorkerService leases work to out-of-process workers (docs/PLAN.md, ADR-0002).
+//
+// A remote worker opens one Claim stream, grants credits (how many more jobs it
+// can run right now) and receives leased jobs, each with a lease fencing token.
+// It then heartbeats, completes or fails every job with (job_id, lease_token)
+// over the unary RPCs. A stale token (the lease expired and was reaped, or the
+// job was claimed again) is rejected, so a worker that lost its lease can never
+// finish the job.
+//
+// Remote workers get at-least-once execution and at-least-once effects: the
+// handler's side effect cannot commit in the same transaction as the job row
+// (job.TxHandler exactly-once is in-process only).
+//
+// Status codes: INVALID_ARGUMENT (bad worker id, queue, job id or token),
+// FAILED_PRECONDITION (the lease is no longer held: expired, reaped, stolen),
+// NOT_FOUND, INTERNAL otherwise.
+type WorkerServiceClient interface {
+	// Claim is the lease stream. The first request must carry worker_id and
+	// queues; every request (the first included) adds credits. The server pushes
+	// at most as many jobs as the worker has granted credits and never more than
+	// it can run. Closing the stream does not release leases already delivered:
+	// the worker keeps heartbeating them, or they expire and the reaper requeues.
+	Claim(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ClaimRequest, ClaimResponse], error)
+	// Heartbeat extends the leases still held by the worker and reports which
+	// ones were lost (the worker must cancel those handlers and never finish them)
+	// and which ones had a cancel requested (stop, then Fail or Complete).
+	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
+	// Complete marks a leased job succeeded (or cancelled when a cancel was
+	// requested meanwhile). FAILED_PRECONDITION when the lease is not held.
+	Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error)
+	// Fail records an attempt failure; the server applies the job's backoff
+	// policy (retry, or dead when permanent / attempts exhausted).
+	Fail(ctx context.Context, in *FailRequest, opts ...grpc.CallOption) (*FailResponse, error)
+}
+
+type workerServiceClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewWorkerServiceClient(cc grpc.ClientConnInterface) WorkerServiceClient {
+	return &workerServiceClient{cc}
+}
+
+func (c *workerServiceClient) Claim(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[ClaimRequest, ClaimResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &WorkerService_ServiceDesc.Streams[0], WorkerService_Claim_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ClaimRequest, ClaimResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type WorkerService_ClaimClient = grpc.BidiStreamingClient[ClaimRequest, ClaimResponse]
+
+func (c *workerServiceClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HeartbeatResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Heartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CompleteResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Complete_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *workerServiceClient) Fail(ctx context.Context, in *FailRequest, opts ...grpc.CallOption) (*FailResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailResponse)
+	err := c.cc.Invoke(ctx, WorkerService_Fail_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WorkerServiceServer is the server API for WorkerService service.
+// All implementations must embed UnimplementedWorkerServiceServer
+// for forward compatibility.
+//
+// WorkerService leases work to out-of-process workers (docs/PLAN.md, ADR-0002).
+//
+// A remote worker opens one Claim stream, grants credits (how many more jobs it
+// can run right now) and receives leased jobs, each with a lease fencing token.
+// It then heartbeats, completes or fails every job with (job_id, lease_token)
+// over the unary RPCs. A stale token (the lease expired and was reaped, or the
+// job was claimed again) is rejected, so a worker that lost its lease can never
+// finish the job.
+//
+// Remote workers get at-least-once execution and at-least-once effects: the
+// handler's side effect cannot commit in the same transaction as the job row
+// (job.TxHandler exactly-once is in-process only).
+//
+// Status codes: INVALID_ARGUMENT (bad worker id, queue, job id or token),
+// FAILED_PRECONDITION (the lease is no longer held: expired, reaped, stolen),
+// NOT_FOUND, INTERNAL otherwise.
+type WorkerServiceServer interface {
+	// Claim is the lease stream. The first request must carry worker_id and
+	// queues; every request (the first included) adds credits. The server pushes
+	// at most as many jobs as the worker has granted credits and never more than
+	// it can run. Closing the stream does not release leases already delivered:
+	// the worker keeps heartbeating them, or they expire and the reaper requeues.
+	Claim(grpc.BidiStreamingServer[ClaimRequest, ClaimResponse]) error
+	// Heartbeat extends the leases still held by the worker and reports which
+	// ones were lost (the worker must cancel those handlers and never finish them)
+	// and which ones had a cancel requested (stop, then Fail or Complete).
+	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
+	// Complete marks a leased job succeeded (or cancelled when a cancel was
+	// requested meanwhile). FAILED_PRECONDITION when the lease is not held.
+	Complete(context.Context, *CompleteRequest) (*CompleteResponse, error)
+	// Fail records an attempt failure; the server applies the job's backoff
+	// policy (retry, or dead when permanent / attempts exhausted).
+	Fail(context.Context, *FailRequest) (*FailResponse, error)
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+// UnimplementedWorkerServiceServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedWorkerServiceServer struct{}
+
+func (UnimplementedWorkerServiceServer) Claim(grpc.BidiStreamingServer[ClaimRequest, ClaimResponse]) error {
+	return status.Error(codes.Unimplemented, "method Claim not implemented")
+}
+func (UnimplementedWorkerServiceServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
+}
+func (UnimplementedWorkerServiceServer) Complete(context.Context, *CompleteRequest) (*CompleteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Complete not implemented")
+}
+func (UnimplementedWorkerServiceServer) Fail(context.Context, *FailRequest) (*FailResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Fail not implemented")
+}
+func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
+func (UnimplementedWorkerServiceServer) testEmbeddedByValue()                       {}
+
+// UnsafeWorkerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to WorkerServiceServer will
+// result in compilation errors.
+type UnsafeWorkerServiceServer interface {
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServer) {
+	// If the following call panics, it indicates UnimplementedWorkerServiceServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&WorkerService_ServiceDesc, srv)
+}
+
+func _WorkerService_Claim_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(WorkerServiceServer).Claim(&grpc.GenericServerStream[ClaimRequest, ClaimResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type WorkerService_ClaimServer = grpc.BidiStreamingServer[ClaimRequest, ClaimResponse]
+
+func _WorkerService_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Heartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Heartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Heartbeat(ctx, req.(*HeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_Complete_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CompleteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Complete(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Complete_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Complete(ctx, req.(*CompleteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _WorkerService_Fail_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FailRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(WorkerServiceServer).Fail(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: WorkerService_Fail_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(WorkerServiceServer).Fail(ctx, req.(*FailRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// WorkerService_ServiceDesc is the grpc.ServiceDesc for WorkerService service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var WorkerService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "jobrun.v1.WorkerService",
+	HandlerType: (*WorkerServiceServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Heartbeat",
+			Handler:    _WorkerService_Heartbeat_Handler,
+		},
+		{
+			MethodName: "Complete",
+			Handler:    _WorkerService_Complete_Handler,
+		},
+		{
+			MethodName: "Fail",
+			Handler:    _WorkerService_Fail_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Claim",
+			Handler:       _WorkerService_Claim_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "jobrun/v1/jobrun.proto",
 }

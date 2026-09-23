@@ -190,8 +190,11 @@ type Job struct {
 	FinishedAt     *timestamppb.Timestamp `protobuf:"bytes,18,opt,name=finished_at,json=finishedAt,proto3" json:"finished_at,omitempty"`
 	// cancel_requested is set by Cancel on a LEASED job until the worker gives it up.
 	CancelRequested bool `protobuf:"varint,19,opt,name=cancel_requested,json=cancelRequested,proto3" json:"cancel_requested,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// traceparent is the W3C trace context captured at enqueue (empty when the
+	// producer was not traced); the run span is its child.
+	Traceparent   string `protobuf:"bytes,20,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Job) Reset() {
@@ -355,6 +358,13 @@ func (x *Job) GetCancelRequested() bool {
 		return x.CancelRequested
 	}
 	return false
+}
+
+func (x *Job) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
 }
 
 // JobEvent is one row of the append-only transition history of a job.
@@ -2071,6 +2081,600 @@ func (x *ListSchedulesResponse) GetNextPageToken() string {
 	return ""
 }
 
+// Lease names one claim of one job: the fencing token is bumped on every claim,
+// so a lease from an earlier attempt can never heartbeat, complete or fail the
+// job again.
+type Lease struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	JobId         string                 `protobuf:"bytes,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Token         int64                  `protobuf:"varint,2,opt,name=token,proto3" json:"token,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Lease) Reset() {
+	*x = Lease{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Lease) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Lease) ProtoMessage() {}
+
+func (x *Lease) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Lease.ProtoReflect.Descriptor instead.
+func (*Lease) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *Lease) GetJobId() string {
+	if x != nil {
+		return x.JobId
+	}
+	return ""
+}
+
+func (x *Lease) GetToken() int64 {
+	if x != nil {
+		return x.Token
+	}
+	return 0
+}
+
+// LeasedJob is one job pushed down a Claim stream.
+type LeasedJob struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Job   *Job                   `protobuf:"bytes,1,opt,name=job,proto3" json:"job,omitempty"`
+	// lease_token is the fencing token of this claim (see Lease).
+	LeaseToken int64 `protobuf:"varint,2,opt,name=lease_token,json=leaseToken,proto3" json:"lease_token,omitempty"`
+	// lease_ttl is how long the lease lasts from the claim and from every
+	// successful heartbeat; heartbeat at most every lease_ttl/3.
+	LeaseTtl *durationpb.Duration `protobuf:"bytes,3,opt,name=lease_ttl,json=leaseTtl,proto3" json:"lease_ttl,omitempty"`
+	// traceparent is the W3C trace context stored when the job was enqueued;
+	// empty when the producer was not traced. The worker starts its run span as
+	// a child of it.
+	Traceparent   string `protobuf:"bytes,4,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeasedJob) Reset() {
+	*x = LeasedJob{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeasedJob) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeasedJob) ProtoMessage() {}
+
+func (x *LeasedJob) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeasedJob.ProtoReflect.Descriptor instead.
+func (*LeasedJob) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *LeasedJob) GetJob() *Job {
+	if x != nil {
+		return x.Job
+	}
+	return nil
+}
+
+func (x *LeasedJob) GetLeaseToken() int64 {
+	if x != nil {
+		return x.LeaseToken
+	}
+	return 0
+}
+
+func (x *LeasedJob) GetLeaseTtl() *durationpb.Duration {
+	if x != nil {
+		return x.LeaseTtl
+	}
+	return nil
+}
+
+func (x *LeasedJob) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+type ClaimRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// worker_id identifies the worker process (1..128 printable ASCII, no
+	// spaces); required on the first message, ignored afterwards.
+	WorkerId string `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// queues to claim from; required on the first message, ignored afterwards.
+	Queues []string `protobuf:"bytes,2,rep,name=queues,proto3" json:"queues,omitempty"`
+	// credits is how many more jobs the worker can take (0..1024 per message).
+	Credits       int32 `protobuf:"varint,3,opt,name=credits,proto3" json:"credits,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClaimRequest) Reset() {
+	*x = ClaimRequest{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClaimRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClaimRequest) ProtoMessage() {}
+
+func (x *ClaimRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClaimRequest.ProtoReflect.Descriptor instead.
+func (*ClaimRequest) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ClaimRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *ClaimRequest) GetQueues() []string {
+	if x != nil {
+		return x.Queues
+	}
+	return nil
+}
+
+func (x *ClaimRequest) GetCredits() int32 {
+	if x != nil {
+		return x.Credits
+	}
+	return 0
+}
+
+type ClaimResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Job           *LeasedJob             `protobuf:"bytes,1,opt,name=job,proto3" json:"job,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ClaimResponse) Reset() {
+	*x = ClaimResponse{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ClaimResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ClaimResponse) ProtoMessage() {}
+
+func (x *ClaimResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ClaimResponse.ProtoReflect.Descriptor instead.
+func (*ClaimResponse) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *ClaimResponse) GetJob() *LeasedJob {
+	if x != nil {
+		return x.Job
+	}
+	return nil
+}
+
+type HeartbeatRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId      string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Leases        []*Lease               `protobuf:"bytes,2,rep,name=leases,proto3" json:"leases,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatRequest) Reset() {
+	*x = HeartbeatRequest{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatRequest) ProtoMessage() {}
+
+func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *HeartbeatRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetLeases() []*Lease {
+	if x != nil {
+		return x.Leases
+	}
+	return nil
+}
+
+type HeartbeatResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Verdicts name leases, not job ids: a worker may hold an old and a new
+	// lease of the same job at once (it reclaimed its own reaped job).
+	//
+	// kept are the leases that were extended.
+	Kept []*Lease `protobuf:"bytes,1,rep,name=kept,proto3" json:"kept,omitempty"`
+	// cancel_requested are held and extended too, but the job was cancelled:
+	// stop the handler, then Fail (or Complete) to record it.
+	CancelRequested []*Lease `protobuf:"bytes,2,rep,name=cancel_requested,json=cancelRequested,proto3" json:"cancel_requested,omitempty"`
+	// lost are the leases that are gone: cancel the handler and never Complete
+	// or Fail it.
+	Lost          []*Lease             `protobuf:"bytes,3,rep,name=lost,proto3" json:"lost,omitempty"`
+	LeaseTtl      *durationpb.Duration `protobuf:"bytes,4,opt,name=lease_ttl,json=leaseTtl,proto3" json:"lease_ttl,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HeartbeatResponse) Reset() {
+	*x = HeartbeatResponse{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HeartbeatResponse) ProtoMessage() {}
+
+func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *HeartbeatResponse) GetKept() []*Lease {
+	if x != nil {
+		return x.Kept
+	}
+	return nil
+}
+
+func (x *HeartbeatResponse) GetCancelRequested() []*Lease {
+	if x != nil {
+		return x.CancelRequested
+	}
+	return nil
+}
+
+func (x *HeartbeatResponse) GetLost() []*Lease {
+	if x != nil {
+		return x.Lost
+	}
+	return nil
+}
+
+func (x *HeartbeatResponse) GetLeaseTtl() *durationpb.Duration {
+	if x != nil {
+		return x.LeaseTtl
+	}
+	return nil
+}
+
+type CompleteRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Lease    *Lease                 `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	// traceparent of the worker's run span; the server's complete span is its child.
+	Traceparent   string `protobuf:"bytes,3,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompleteRequest) Reset() {
+	*x = CompleteRequest{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompleteRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompleteRequest) ProtoMessage() {}
+
+func (x *CompleteRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompleteRequest.ProtoReflect.Descriptor instead.
+func (*CompleteRequest) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *CompleteRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *CompleteRequest) GetLease() *Lease {
+	if x != nil {
+		return x.Lease
+	}
+	return nil
+}
+
+func (x *CompleteRequest) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+type CompleteResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Status        JobStatus              `protobuf:"varint,1,opt,name=status,proto3,enum=jobrun.v1.JobStatus" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CompleteResponse) Reset() {
+	*x = CompleteResponse{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CompleteResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CompleteResponse) ProtoMessage() {}
+
+func (x *CompleteResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CompleteResponse.ProtoReflect.Descriptor instead.
+func (*CompleteResponse) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *CompleteResponse) GetStatus() JobStatus {
+	if x != nil {
+		return x.Status
+	}
+	return JobStatus_JOB_STATUS_UNSPECIFIED
+}
+
+type FailRequest struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	Lease    *Lease                 `protobuf:"bytes,2,opt,name=lease,proto3" json:"lease,omitempty"`
+	// error is stored as last_error (sanitised and truncated server side).
+	Error string `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	// permanent skips retries: the job goes straight to dead.
+	Permanent     bool   `protobuf:"varint,4,opt,name=permanent,proto3" json:"permanent,omitempty"`
+	Traceparent   string `protobuf:"bytes,5,opt,name=traceparent,proto3" json:"traceparent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FailRequest) Reset() {
+	*x = FailRequest{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FailRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FailRequest) ProtoMessage() {}
+
+func (x *FailRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FailRequest.ProtoReflect.Descriptor instead.
+func (*FailRequest) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *FailRequest) GetWorkerId() string {
+	if x != nil {
+		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *FailRequest) GetLease() *Lease {
+	if x != nil {
+		return x.Lease
+	}
+	return nil
+}
+
+func (x *FailRequest) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+func (x *FailRequest) GetPermanent() bool {
+	if x != nil {
+		return x.Permanent
+	}
+	return false
+}
+
+func (x *FailRequest) GetTraceparent() string {
+	if x != nil {
+		return x.Traceparent
+	}
+	return ""
+}
+
+type FailResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// status is QUEUED (will retry), DEAD or CANCELLED.
+	Status        JobStatus `protobuf:"varint,1,opt,name=status,proto3,enum=jobrun.v1.JobStatus" json:"status,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FailResponse) Reset() {
+	*x = FailResponse{}
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FailResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FailResponse) ProtoMessage() {}
+
+func (x *FailResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_jobrun_v1_jobrun_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FailResponse.ProtoReflect.Descriptor instead.
+func (*FailResponse) Descriptor() ([]byte, []int) {
+	return file_jobrun_v1_jobrun_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *FailResponse) GetStatus() JobStatus {
+	if x != nil {
+		return x.Status
+	}
+	return JobStatus_JOB_STATUS_UNSPECIFIED
+}
+
 var File_jobrun_v1_jobrun_proto protoreflect.FileDescriptor
 
 const file_jobrun_v1_jobrun_proto_rawDesc = "" +
@@ -2080,7 +2684,7 @@ const file_jobrun_v1_jobrun_proto_rawDesc = "" +
 	"\x04base\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\x04base\x12+\n" +
 	"\x03max\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03max\x12\x16\n" +
 	"\x06factor\x18\x03 \x01(\x01R\x06factor\x12\x16\n" +
-	"\x06jitter\x18\x04 \x01(\bR\x06jitter\"\x88\x06\n" +
+	"\x06jitter\x18\x04 \x01(\bR\x06jitter\"\xaa\x06\n" +
 	"\x03Job\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x14\n" +
 	"\x05queue\x18\x02 \x01(\tR\x05queue\x12\x12\n" +
@@ -2108,7 +2712,8 @@ const file_jobrun_v1_jobrun_proto_rawDesc = "" +
 	"started_at\x18\x11 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12;\n" +
 	"\vfinished_at\x18\x12 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"finishedAt\x12)\n" +
-	"\x10cancel_requested\x18\x13 \x01(\bR\x0fcancelRequested\"\x91\x02\n" +
+	"\x10cancel_requested\x18\x13 \x01(\bR\x0fcancelRequested\x12 \n" +
+	"\vtraceparent\x18\x14 \x01(\tR\vtraceparent\"\x91\x02\n" +
 	"\bJobEvent\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
 	"\x05queue\x18\x02 \x01(\tR\x05queue\x12\x12\n" +
@@ -2233,7 +2838,44 @@ const file_jobrun_v1_jobrun_proto_rawDesc = "" +
 	"\tpage_size\x18\x02 \x01(\x05R\bpageSize\"r\n" +
 	"\x15ListSchedulesResponse\x121\n" +
 	"\tschedules\x18\x01 \x03(\v2\x13.jobrun.v1.ScheduleR\tschedules\x12&\n" +
-	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken*\xb5\x01\n" +
+	"\x0fnext_page_token\x18\x02 \x01(\tR\rnextPageToken\"4\n" +
+	"\x05Lease\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\tR\x05jobId\x12\x14\n" +
+	"\x05token\x18\x02 \x01(\x03R\x05token\"\xa8\x01\n" +
+	"\tLeasedJob\x12 \n" +
+	"\x03job\x18\x01 \x01(\v2\x0e.jobrun.v1.JobR\x03job\x12\x1f\n" +
+	"\vlease_token\x18\x02 \x01(\x03R\n" +
+	"leaseToken\x126\n" +
+	"\tlease_ttl\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\bleaseTtl\x12 \n" +
+	"\vtraceparent\x18\x04 \x01(\tR\vtraceparent\"]\n" +
+	"\fClaimRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x16\n" +
+	"\x06queues\x18\x02 \x03(\tR\x06queues\x12\x18\n" +
+	"\acredits\x18\x03 \x01(\x05R\acredits\"7\n" +
+	"\rClaimResponse\x12&\n" +
+	"\x03job\x18\x01 \x01(\v2\x14.jobrun.v1.LeasedJobR\x03job\"Y\n" +
+	"\x10HeartbeatRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12(\n" +
+	"\x06leases\x18\x02 \x03(\v2\x10.jobrun.v1.LeaseR\x06leases\"\xd4\x01\n" +
+	"\x11HeartbeatResponse\x12$\n" +
+	"\x04kept\x18\x01 \x03(\v2\x10.jobrun.v1.LeaseR\x04kept\x12;\n" +
+	"\x10cancel_requested\x18\x02 \x03(\v2\x10.jobrun.v1.LeaseR\x0fcancelRequested\x12$\n" +
+	"\x04lost\x18\x03 \x03(\v2\x10.jobrun.v1.LeaseR\x04lost\x126\n" +
+	"\tlease_ttl\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\bleaseTtl\"x\n" +
+	"\x0fCompleteRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12&\n" +
+	"\x05lease\x18\x02 \x01(\v2\x10.jobrun.v1.LeaseR\x05lease\x12 \n" +
+	"\vtraceparent\x18\x03 \x01(\tR\vtraceparent\"@\n" +
+	"\x10CompleteResponse\x12,\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x14.jobrun.v1.JobStatusR\x06status\"\xa8\x01\n" +
+	"\vFailRequest\x12\x1b\n" +
+	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12&\n" +
+	"\x05lease\x18\x02 \x01(\v2\x10.jobrun.v1.LeaseR\x05lease\x12\x14\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12\x1c\n" +
+	"\tpermanent\x18\x04 \x01(\bR\tpermanent\x12 \n" +
+	"\vtraceparent\x18\x05 \x01(\tR\vtraceparent\"<\n" +
+	"\fFailResponse\x12,\n" +
+	"\x06status\x18\x01 \x01(\x0e2\x14.jobrun.v1.JobStatusR\x06status*\xb5\x01\n" +
 	"\tJobStatus\x12\x1a\n" +
 	"\x16JOB_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11JOB_STATUS_QUEUED\x10\x01\x12\x15\n" +
@@ -2256,7 +2898,12 @@ const file_jobrun_v1_jobrun_proto_rawDesc = "" +
 	"\x0eUpdateSchedule\x12 .jobrun.v1.UpdateScheduleRequest\x1a!.jobrun.v1.UpdateScheduleResponse\"\x00\x12W\n" +
 	"\x0eDeleteSchedule\x12 .jobrun.v1.DeleteScheduleRequest\x1a!.jobrun.v1.DeleteScheduleResponse\"\x00\x12N\n" +
 	"\vGetSchedule\x12\x1d.jobrun.v1.GetScheduleRequest\x1a\x1e.jobrun.v1.GetScheduleResponse\"\x00\x12T\n" +
-	"\rListSchedules\x12\x1f.jobrun.v1.ListSchedulesRequest\x1a .jobrun.v1.ListSchedulesResponse\"\x00B?Z=github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1b\x06proto3"
+	"\rListSchedules\x12\x1f.jobrun.v1.ListSchedulesRequest\x1a .jobrun.v1.ListSchedulesResponse\"\x002\x9d\x02\n" +
+	"\rWorkerService\x12@\n" +
+	"\x05Claim\x12\x17.jobrun.v1.ClaimRequest\x1a\x18.jobrun.v1.ClaimResponse\"\x00(\x010\x01\x12H\n" +
+	"\tHeartbeat\x12\x1b.jobrun.v1.HeartbeatRequest\x1a\x1c.jobrun.v1.HeartbeatResponse\"\x00\x12E\n" +
+	"\bComplete\x12\x1a.jobrun.v1.CompleteRequest\x1a\x1b.jobrun.v1.CompleteResponse\"\x00\x129\n" +
+	"\x04Fail\x12\x16.jobrun.v1.FailRequest\x1a\x17.jobrun.v1.FailResponse\"\x00B?Z=github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1b\x06proto3"
 
 var (
 	file_jobrun_v1_jobrun_proto_rawDescOnce sync.Once
@@ -2271,7 +2918,7 @@ func file_jobrun_v1_jobrun_proto_rawDescGZIP() []byte {
 }
 
 var file_jobrun_v1_jobrun_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_jobrun_v1_jobrun_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_jobrun_v1_jobrun_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
 var file_jobrun_v1_jobrun_proto_goTypes = []any{
 	(JobStatus)(0),                 // 0: jobrun.v1.JobStatus
 	(*BackoffPolicy)(nil),          // 1: jobrun.v1.BackoffPolicy
@@ -2304,31 +2951,41 @@ var file_jobrun_v1_jobrun_proto_goTypes = []any{
 	(*GetScheduleResponse)(nil),    // 28: jobrun.v1.GetScheduleResponse
 	(*ListSchedulesRequest)(nil),   // 29: jobrun.v1.ListSchedulesRequest
 	(*ListSchedulesResponse)(nil),  // 30: jobrun.v1.ListSchedulesResponse
-	(*durationpb.Duration)(nil),    // 31: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),  // 32: google.protobuf.Timestamp
+	(*Lease)(nil),                  // 31: jobrun.v1.Lease
+	(*LeasedJob)(nil),              // 32: jobrun.v1.LeasedJob
+	(*ClaimRequest)(nil),           // 33: jobrun.v1.ClaimRequest
+	(*ClaimResponse)(nil),          // 34: jobrun.v1.ClaimResponse
+	(*HeartbeatRequest)(nil),       // 35: jobrun.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),      // 36: jobrun.v1.HeartbeatResponse
+	(*CompleteRequest)(nil),        // 37: jobrun.v1.CompleteRequest
+	(*CompleteResponse)(nil),       // 38: jobrun.v1.CompleteResponse
+	(*FailRequest)(nil),            // 39: jobrun.v1.FailRequest
+	(*FailResponse)(nil),           // 40: jobrun.v1.FailResponse
+	(*durationpb.Duration)(nil),    // 41: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),  // 42: google.protobuf.Timestamp
 }
 var file_jobrun_v1_jobrun_proto_depIdxs = []int32{
-	31, // 0: jobrun.v1.BackoffPolicy.base:type_name -> google.protobuf.Duration
-	31, // 1: jobrun.v1.BackoffPolicy.max:type_name -> google.protobuf.Duration
+	41, // 0: jobrun.v1.BackoffPolicy.base:type_name -> google.protobuf.Duration
+	41, // 1: jobrun.v1.BackoffPolicy.max:type_name -> google.protobuf.Duration
 	0,  // 2: jobrun.v1.Job.status:type_name -> jobrun.v1.JobStatus
-	32, // 3: jobrun.v1.Job.run_at:type_name -> google.protobuf.Timestamp
+	42, // 3: jobrun.v1.Job.run_at:type_name -> google.protobuf.Timestamp
 	1,  // 4: jobrun.v1.Job.backoff:type_name -> jobrun.v1.BackoffPolicy
-	32, // 5: jobrun.v1.Job.lease_until:type_name -> google.protobuf.Timestamp
-	32, // 6: jobrun.v1.Job.created_at:type_name -> google.protobuf.Timestamp
-	32, // 7: jobrun.v1.Job.updated_at:type_name -> google.protobuf.Timestamp
-	32, // 8: jobrun.v1.Job.started_at:type_name -> google.protobuf.Timestamp
-	32, // 9: jobrun.v1.Job.finished_at:type_name -> google.protobuf.Timestamp
+	42, // 5: jobrun.v1.Job.lease_until:type_name -> google.protobuf.Timestamp
+	42, // 6: jobrun.v1.Job.created_at:type_name -> google.protobuf.Timestamp
+	42, // 7: jobrun.v1.Job.updated_at:type_name -> google.protobuf.Timestamp
+	42, // 8: jobrun.v1.Job.started_at:type_name -> google.protobuf.Timestamp
+	42, // 9: jobrun.v1.Job.finished_at:type_name -> google.protobuf.Timestamp
 	0,  // 10: jobrun.v1.JobEvent.from_status:type_name -> jobrun.v1.JobStatus
 	0,  // 11: jobrun.v1.JobEvent.to_status:type_name -> jobrun.v1.JobStatus
-	32, // 12: jobrun.v1.JobEvent.at:type_name -> google.protobuf.Timestamp
+	42, // 12: jobrun.v1.JobEvent.at:type_name -> google.protobuf.Timestamp
 	1,  // 13: jobrun.v1.JobTemplate.backoff:type_name -> jobrun.v1.BackoffPolicy
 	4,  // 14: jobrun.v1.Schedule.template:type_name -> jobrun.v1.JobTemplate
-	32, // 15: jobrun.v1.Schedule.next_run:type_name -> google.protobuf.Timestamp
-	32, // 16: jobrun.v1.Schedule.last_run:type_name -> google.protobuf.Timestamp
-	32, // 17: jobrun.v1.Schedule.created_at:type_name -> google.protobuf.Timestamp
-	32, // 18: jobrun.v1.Schedule.updated_at:type_name -> google.protobuf.Timestamp
-	32, // 19: jobrun.v1.EnqueueRequest.run_at:type_name -> google.protobuf.Timestamp
-	31, // 20: jobrun.v1.EnqueueRequest.delay:type_name -> google.protobuf.Duration
+	42, // 15: jobrun.v1.Schedule.next_run:type_name -> google.protobuf.Timestamp
+	42, // 16: jobrun.v1.Schedule.last_run:type_name -> google.protobuf.Timestamp
+	42, // 17: jobrun.v1.Schedule.created_at:type_name -> google.protobuf.Timestamp
+	42, // 18: jobrun.v1.Schedule.updated_at:type_name -> google.protobuf.Timestamp
+	42, // 19: jobrun.v1.EnqueueRequest.run_at:type_name -> google.protobuf.Timestamp
+	41, // 20: jobrun.v1.EnqueueRequest.delay:type_name -> google.protobuf.Duration
 	1,  // 21: jobrun.v1.EnqueueRequest.backoff:type_name -> jobrun.v1.BackoffPolicy
 	2,  // 22: jobrun.v1.EnqueueResponse.job:type_name -> jobrun.v1.Job
 	2,  // 23: jobrun.v1.GetResponse.job:type_name -> jobrun.v1.Job
@@ -2338,46 +2995,66 @@ var file_jobrun_v1_jobrun_proto_depIdxs = []int32{
 	2,  // 27: jobrun.v1.CancelResponse.job:type_name -> jobrun.v1.Job
 	2,  // 28: jobrun.v1.RetryResponse.job:type_name -> jobrun.v1.Job
 	0,  // 29: jobrun.v1.PurgeRequest.statuses:type_name -> jobrun.v1.JobStatus
-	31, // 30: jobrun.v1.PurgeRequest.older_than:type_name -> google.protobuf.Duration
+	41, // 30: jobrun.v1.PurgeRequest.older_than:type_name -> google.protobuf.Duration
 	0,  // 31: jobrun.v1.QueueDepth.status:type_name -> jobrun.v1.JobStatus
-	32, // 32: jobrun.v1.QueueDepth.oldest_run_at:type_name -> google.protobuf.Timestamp
+	42, // 32: jobrun.v1.QueueDepth.oldest_run_at:type_name -> google.protobuf.Timestamp
 	19, // 33: jobrun.v1.StatsResponse.depths:type_name -> jobrun.v1.QueueDepth
-	32, // 34: jobrun.v1.StatsResponse.as_of:type_name -> google.protobuf.Timestamp
+	42, // 34: jobrun.v1.StatsResponse.as_of:type_name -> google.protobuf.Timestamp
 	4,  // 35: jobrun.v1.CreateScheduleRequest.template:type_name -> jobrun.v1.JobTemplate
 	5,  // 36: jobrun.v1.CreateScheduleResponse.schedule:type_name -> jobrun.v1.Schedule
 	4,  // 37: jobrun.v1.UpdateScheduleRequest.template:type_name -> jobrun.v1.JobTemplate
 	5,  // 38: jobrun.v1.UpdateScheduleResponse.schedule:type_name -> jobrun.v1.Schedule
 	5,  // 39: jobrun.v1.GetScheduleResponse.schedule:type_name -> jobrun.v1.Schedule
 	5,  // 40: jobrun.v1.ListSchedulesResponse.schedules:type_name -> jobrun.v1.Schedule
-	6,  // 41: jobrun.v1.JobService.Enqueue:input_type -> jobrun.v1.EnqueueRequest
-	8,  // 42: jobrun.v1.JobService.Get:input_type -> jobrun.v1.GetRequest
-	10, // 43: jobrun.v1.JobService.List:input_type -> jobrun.v1.ListRequest
-	12, // 44: jobrun.v1.JobService.Cancel:input_type -> jobrun.v1.CancelRequest
-	14, // 45: jobrun.v1.JobService.Retry:input_type -> jobrun.v1.RetryRequest
-	16, // 46: jobrun.v1.JobService.Purge:input_type -> jobrun.v1.PurgeRequest
-	18, // 47: jobrun.v1.JobService.Stats:input_type -> jobrun.v1.StatsRequest
-	21, // 48: jobrun.v1.ScheduleService.CreateSchedule:input_type -> jobrun.v1.CreateScheduleRequest
-	23, // 49: jobrun.v1.ScheduleService.UpdateSchedule:input_type -> jobrun.v1.UpdateScheduleRequest
-	25, // 50: jobrun.v1.ScheduleService.DeleteSchedule:input_type -> jobrun.v1.DeleteScheduleRequest
-	27, // 51: jobrun.v1.ScheduleService.GetSchedule:input_type -> jobrun.v1.GetScheduleRequest
-	29, // 52: jobrun.v1.ScheduleService.ListSchedules:input_type -> jobrun.v1.ListSchedulesRequest
-	7,  // 53: jobrun.v1.JobService.Enqueue:output_type -> jobrun.v1.EnqueueResponse
-	9,  // 54: jobrun.v1.JobService.Get:output_type -> jobrun.v1.GetResponse
-	11, // 55: jobrun.v1.JobService.List:output_type -> jobrun.v1.ListResponse
-	13, // 56: jobrun.v1.JobService.Cancel:output_type -> jobrun.v1.CancelResponse
-	15, // 57: jobrun.v1.JobService.Retry:output_type -> jobrun.v1.RetryResponse
-	17, // 58: jobrun.v1.JobService.Purge:output_type -> jobrun.v1.PurgeResponse
-	20, // 59: jobrun.v1.JobService.Stats:output_type -> jobrun.v1.StatsResponse
-	22, // 60: jobrun.v1.ScheduleService.CreateSchedule:output_type -> jobrun.v1.CreateScheduleResponse
-	24, // 61: jobrun.v1.ScheduleService.UpdateSchedule:output_type -> jobrun.v1.UpdateScheduleResponse
-	26, // 62: jobrun.v1.ScheduleService.DeleteSchedule:output_type -> jobrun.v1.DeleteScheduleResponse
-	28, // 63: jobrun.v1.ScheduleService.GetSchedule:output_type -> jobrun.v1.GetScheduleResponse
-	30, // 64: jobrun.v1.ScheduleService.ListSchedules:output_type -> jobrun.v1.ListSchedulesResponse
-	53, // [53:65] is the sub-list for method output_type
-	41, // [41:53] is the sub-list for method input_type
-	41, // [41:41] is the sub-list for extension type_name
-	41, // [41:41] is the sub-list for extension extendee
-	0,  // [0:41] is the sub-list for field type_name
+	2,  // 41: jobrun.v1.LeasedJob.job:type_name -> jobrun.v1.Job
+	41, // 42: jobrun.v1.LeasedJob.lease_ttl:type_name -> google.protobuf.Duration
+	32, // 43: jobrun.v1.ClaimResponse.job:type_name -> jobrun.v1.LeasedJob
+	31, // 44: jobrun.v1.HeartbeatRequest.leases:type_name -> jobrun.v1.Lease
+	31, // 45: jobrun.v1.HeartbeatResponse.kept:type_name -> jobrun.v1.Lease
+	31, // 46: jobrun.v1.HeartbeatResponse.cancel_requested:type_name -> jobrun.v1.Lease
+	31, // 47: jobrun.v1.HeartbeatResponse.lost:type_name -> jobrun.v1.Lease
+	41, // 48: jobrun.v1.HeartbeatResponse.lease_ttl:type_name -> google.protobuf.Duration
+	31, // 49: jobrun.v1.CompleteRequest.lease:type_name -> jobrun.v1.Lease
+	0,  // 50: jobrun.v1.CompleteResponse.status:type_name -> jobrun.v1.JobStatus
+	31, // 51: jobrun.v1.FailRequest.lease:type_name -> jobrun.v1.Lease
+	0,  // 52: jobrun.v1.FailResponse.status:type_name -> jobrun.v1.JobStatus
+	6,  // 53: jobrun.v1.JobService.Enqueue:input_type -> jobrun.v1.EnqueueRequest
+	8,  // 54: jobrun.v1.JobService.Get:input_type -> jobrun.v1.GetRequest
+	10, // 55: jobrun.v1.JobService.List:input_type -> jobrun.v1.ListRequest
+	12, // 56: jobrun.v1.JobService.Cancel:input_type -> jobrun.v1.CancelRequest
+	14, // 57: jobrun.v1.JobService.Retry:input_type -> jobrun.v1.RetryRequest
+	16, // 58: jobrun.v1.JobService.Purge:input_type -> jobrun.v1.PurgeRequest
+	18, // 59: jobrun.v1.JobService.Stats:input_type -> jobrun.v1.StatsRequest
+	21, // 60: jobrun.v1.ScheduleService.CreateSchedule:input_type -> jobrun.v1.CreateScheduleRequest
+	23, // 61: jobrun.v1.ScheduleService.UpdateSchedule:input_type -> jobrun.v1.UpdateScheduleRequest
+	25, // 62: jobrun.v1.ScheduleService.DeleteSchedule:input_type -> jobrun.v1.DeleteScheduleRequest
+	27, // 63: jobrun.v1.ScheduleService.GetSchedule:input_type -> jobrun.v1.GetScheduleRequest
+	29, // 64: jobrun.v1.ScheduleService.ListSchedules:input_type -> jobrun.v1.ListSchedulesRequest
+	33, // 65: jobrun.v1.WorkerService.Claim:input_type -> jobrun.v1.ClaimRequest
+	35, // 66: jobrun.v1.WorkerService.Heartbeat:input_type -> jobrun.v1.HeartbeatRequest
+	37, // 67: jobrun.v1.WorkerService.Complete:input_type -> jobrun.v1.CompleteRequest
+	39, // 68: jobrun.v1.WorkerService.Fail:input_type -> jobrun.v1.FailRequest
+	7,  // 69: jobrun.v1.JobService.Enqueue:output_type -> jobrun.v1.EnqueueResponse
+	9,  // 70: jobrun.v1.JobService.Get:output_type -> jobrun.v1.GetResponse
+	11, // 71: jobrun.v1.JobService.List:output_type -> jobrun.v1.ListResponse
+	13, // 72: jobrun.v1.JobService.Cancel:output_type -> jobrun.v1.CancelResponse
+	15, // 73: jobrun.v1.JobService.Retry:output_type -> jobrun.v1.RetryResponse
+	17, // 74: jobrun.v1.JobService.Purge:output_type -> jobrun.v1.PurgeResponse
+	20, // 75: jobrun.v1.JobService.Stats:output_type -> jobrun.v1.StatsResponse
+	22, // 76: jobrun.v1.ScheduleService.CreateSchedule:output_type -> jobrun.v1.CreateScheduleResponse
+	24, // 77: jobrun.v1.ScheduleService.UpdateSchedule:output_type -> jobrun.v1.UpdateScheduleResponse
+	26, // 78: jobrun.v1.ScheduleService.DeleteSchedule:output_type -> jobrun.v1.DeleteScheduleResponse
+	28, // 79: jobrun.v1.ScheduleService.GetSchedule:output_type -> jobrun.v1.GetScheduleResponse
+	30, // 80: jobrun.v1.ScheduleService.ListSchedules:output_type -> jobrun.v1.ListSchedulesResponse
+	34, // 81: jobrun.v1.WorkerService.Claim:output_type -> jobrun.v1.ClaimResponse
+	36, // 82: jobrun.v1.WorkerService.Heartbeat:output_type -> jobrun.v1.HeartbeatResponse
+	38, // 83: jobrun.v1.WorkerService.Complete:output_type -> jobrun.v1.CompleteResponse
+	40, // 84: jobrun.v1.WorkerService.Fail:output_type -> jobrun.v1.FailResponse
+	69, // [69:85] is the sub-list for method output_type
+	53, // [53:69] is the sub-list for method input_type
+	53, // [53:53] is the sub-list for extension type_name
+	53, // [53:53] is the sub-list for extension extendee
+	0,  // [0:53] is the sub-list for field type_name
 }
 
 func init() { file_jobrun_v1_jobrun_proto_init() }
@@ -2397,9 +3074,9 @@ func file_jobrun_v1_jobrun_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_jobrun_v1_jobrun_proto_rawDesc), len(file_jobrun_v1_jobrun_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   30,
+			NumMessages:   40,
 			NumExtensions: 0,
-			NumServices:   2,
+			NumServices:   3,
 		},
 		GoTypes:           file_jobrun_v1_jobrun_proto_goTypes,
 		DependencyIndexes: file_jobrun_v1_jobrun_proto_depIdxs,
