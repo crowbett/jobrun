@@ -150,6 +150,11 @@ type Worker struct {
 	// is still unwinding.
 	mu       sync.Mutex
 	inflight map[leaseKey]*lease
+
+	// creditMu makes "free a slot + grant it on the current stream" atomic with
+	// "count free slots + send the hello + publish the stream", so a freed slot
+	// is granted exactly once: by the hello or by a grant, never both.
+	creditMu sync.Mutex
 	stream   grpc.BidiStreamingClient[jobrunv1.ClaimRequest, jobrunv1.ClaimResponse] // current Claim stream, nil between reconnects
 	sendMu   sync.Mutex                                                              // serialises Send on stream
 
@@ -337,20 +342,22 @@ func (w *Worker) session(ctx, base context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open claim stream: %w", err)
 	}
+	w.creditMu.Lock()
 	free := int32(cap(w.sem) - len(w.sem)) //nolint:gosec // bounded by Concurrency
 	w.sendMu.Lock()
 	err = stream.Send(&jobrunv1.ClaimRequest{WorkerId: w.cfg.WorkerID, Queues: w.cfg.Queues, Credits: free})
 	w.sendMu.Unlock()
+	if err == nil {
+		w.stream = stream
+	}
+	w.creditMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("claim hello: %w", err)
 	}
-	w.mu.Lock()
-	w.stream = stream
-	w.mu.Unlock()
 	defer func() {
-		w.mu.Lock()
+		w.creditMu.Lock()
 		w.stream = nil
-		w.mu.Unlock()
+		w.creditMu.Unlock()
 		w.sendMu.Lock()
 		_ = stream.CloseSend()
 		w.sendMu.Unlock()
@@ -392,12 +399,13 @@ func toJob(lj *jobrunv1.LeasedJob) Job {
 	}
 }
 
-// grant returns one credit on the current stream (if any): the next session's
-// hello re-grants every free slot anyway.
-func (w *Worker) grant() {
-	w.mu.Lock()
+// release frees a slot and grants it on the current stream (if any); with no
+// stream, the next session's hello counts it.
+func (w *Worker) release() {
+	w.creditMu.Lock()
+	<-w.sem
 	stream := w.stream
-	w.mu.Unlock()
+	w.creditMu.Unlock()
 	if stream == nil {
 		return
 	}
@@ -410,10 +418,7 @@ func (w *Worker) grant() {
 
 func (w *Worker) run(base context.Context, j Job, receivedAt time.Time) {
 	defer w.wg.Done()
-	defer func() {
-		<-w.sem
-		w.grant()
-	}()
+	defer w.release()
 	w.inFlight.Add(1)
 	defer w.inFlight.Add(-1)
 	log := w.log.With("job", j.ID, "queue", j.Queue, "type", j.Type, "attempt", j.Attempt, "token", j.LeaseToken)
