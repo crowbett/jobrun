@@ -2,6 +2,7 @@ package obs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -139,4 +140,60 @@ func TestSpanHelpers(t *testing.T) { //nolint:paralleltest // swaps the global t
 	if s := byName[SpanComplete]; s == nil || s.Status().Code != codes.Unset {
 		t.Errorf("complete span = %+v", s)
 	}
+}
+
+func TestTraceParentRoundTrip(t *testing.T) {
+	t.Parallel()
+	const valid = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	tests := []struct {
+		name string
+		in   string
+		want string // TraceParent of the context WithTraceParent returns
+	}{
+		{name: "valid", in: valid, want: valid},
+		{name: "empty", in: "", want: ""},
+		{name: "malformed", in: "00-zz-yy-01", want: ""},
+		{name: "all-zero trace id", in: "00-00000000000000000000000000000000-00f067aa0ba902b7-01", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := TraceParent(WithTraceParent(context.Background(), tc.in)); got != tc.want {
+				t.Fatalf("TraceParent(WithTraceParent(%q)) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+	if got := TraceParent(context.Background()); got != "" {
+		t.Fatalf("untraced ctx: %q", got)
+	}
+}
+
+// FuzzWithTraceParent: a traceparent read back from the database or the wire
+// never panics the extractor, and whatever it accepts round-trips to the same
+// trace and parent span.
+func FuzzWithTraceParent(f *testing.F) {
+	for _, s := range []string{
+		"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+		"ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+		"", "00-zz-yy-01", "00--", "\x00",
+	} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, tp string) {
+		ctx := WithTraceParent(context.Background(), tp)
+		sc := trace.SpanContextFromContext(ctx)
+		out := TraceParent(ctx)
+		if sc.IsValid() != (out != "") {
+			t.Fatalf("valid=%v but TraceParent=%q", sc.IsValid(), out)
+		}
+		if out == "" {
+			return
+		}
+		back := trace.SpanContextFromContext(WithTraceParent(context.Background(), out))
+		if back.TraceID() != sc.TraceID() || back.SpanID() != sc.SpanID() || back.TraceFlags() != sc.TraceFlags() {
+			t.Fatalf("round trip %q -> %q changed the span context", tp, out)
+		}
+	})
 }

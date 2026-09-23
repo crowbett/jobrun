@@ -31,7 +31,7 @@ func fullCounters() func() Counters {
 				{"mail", OutcomeSucceeded}: 7, {"default", OutcomeDead}: 2, {"default", OutcomeSucceeded}: 120,
 				{"default", OutcomeRetried}: 9, {"default", OutcomeCancelled}: 1,
 			},
-			Dead: 2, LeaseExpired: 4, SchedulerTicks: 33,
+			Dead: 2, LeaseExpired: 4, SchedulerTicks: 33, LeaseFenced: 7,
 		}
 	}
 }
@@ -74,6 +74,9 @@ jobrun_dead_total 2
 # HELP jobrun_lease_expired_total Leases the reaper found expired and requeued or killed.
 # TYPE jobrun_lease_expired_total counter
 jobrun_lease_expired_total 4
+# HELP jobrun_lease_fenced_total Handlers cancelled because a heartbeat found their lease lost; never completed.
+# TYPE jobrun_lease_fenced_total counter
+jobrun_lease_fenced_total 7
 # HELP jobrun_scheduler_ticks_total Scheduler ticks run by this process while it held the leader lock.
 # TYPE jobrun_scheduler_ticks_total counter
 jobrun_scheduler_ticks_total 33

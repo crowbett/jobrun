@@ -5,18 +5,18 @@
 -- run_at: an absolute client-supplied time, or NULL for now() + delay on the DB clock.
 -- The partial unique index jobs_idem_uniq makes the ON CONFLICT target; a NULL key
 -- never conflicts. No row returned means the (queue, idempotency_key) already exists.
-INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key)
+INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key, traceparent)
 VALUES (
     sqlc.arg('id'), sqlc.arg('queue'), sqlc.arg('type'), sqlc.arg('payload'), sqlc.arg('priority'),
     COALESCE(sqlc.narg('run_at')::timestamptz, now() + sqlc.arg('delay')::interval),
-    sqlc.arg('max_attempts'), sqlc.arg('backoff'), sqlc.narg('idempotency_key')
+    sqlc.arg('max_attempts'), sqlc.arg('backoff'), sqlc.narg('idempotency_key'), sqlc.narg('traceparent')
 )
 ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 RETURNING *;
 
 -- name: InsertJobsCopy :copyfrom
-INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key, traceparent)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);
 
 -- name: GetJob :one
 SELECT * FROM jobs WHERE id = $1;
@@ -30,7 +30,8 @@ SELECT * FROM jobs WHERE queue = sqlc.arg('queue') AND idempotency_key = sqlc.ar
 -- name: ClaimJobs :many
 -- One round trip = batch claim + lease + attempts++. The CTE takes the row locks
 -- (SKIP LOCKED, so concurrent claimers never wait on each other) and the UPDATE
--- flips them to leased. started_at is the first claim; attempts counts starts.
+-- flips them to leased. started_at is the first claim; attempts counts starts;
+-- lease_token is bumped so every claim carries a fresh fencing token.
 WITH ready AS (
     SELECT jobs.id FROM jobs
      WHERE jobs.status = 'queued' AND jobs.queue = sqlc.arg('queue_name') AND jobs.run_at <= now()
@@ -43,6 +44,7 @@ UPDATE jobs AS j
        lease_owner = sqlc.arg('owner')::text,
        lease_until = now() + sqlc.arg('ttl')::interval,
        attempts = j.attempts + 1,
+       lease_token = j.lease_token + 1,
        started_at = COALESCE(j.started_at, now()),
        updated_at = now()
   FROM ready
@@ -50,25 +52,30 @@ UPDATE jobs AS j
 RETURNING j.*;
 
 -- name: HeartbeatLeases :many
--- Returns the ids actually extended. A lease that already expired is not revived
+-- Returns the leases actually extended: (id, token) pairs zipped by the parallel
+-- unnest, guarded by owner and token. A lease that already expired is not revived
 -- (fencing: once lease_until has passed the reaper may take the job at any moment),
--- and cancel_requested is returned so the store can omit cancelled ids from kept.
-UPDATE jobs
+-- and cancel_requested is returned so the store can report cancelled ids apart.
+UPDATE jobs AS j
    SET lease_until = sqlc.arg('until')::timestamptz, updated_at = now()
- WHERE id = ANY(sqlc.arg('ids')::uuid[])
-   AND status = 'leased'
-   AND lease_owner = sqlc.arg('owner')::text
-   AND lease_until > now()
-RETURNING id, cancel_requested;
+  FROM (SELECT unnest(sqlc.arg('ids')::uuid[]) AS id, unnest(sqlc.arg('tokens')::bigint[]) AS token) AS l
+ WHERE j.id = l.id
+   AND j.lease_token = l.token
+   AND j.status = 'leased'
+   AND j.lease_owner = sqlc.arg('owner')::text
+   AND j.lease_until > now()
+RETURNING j.id, j.lease_token, j.cancel_requested;
 
 -- name: CompleteJob :one
--- Owner-guarded so a stale worker cannot resurrect a reaped job. A job whose cancel
--- was requested while it ran ends cancelled, not succeeded. No row = ErrLeaseLost.
+-- Owner- and token-guarded so a stale worker cannot resurrect a reaped job. A job
+-- whose cancel was requested while it ran ends cancelled, not succeeded. No row =
+-- ErrLeaseLost.
 UPDATE jobs
    SET status = (CASE WHEN cancel_requested THEN 'cancelled' ELSE 'succeeded' END)::job_status,
        lease_owner = NULL, lease_until = NULL, last_error = NULL,
        finished_at = now(), updated_at = now()
  WHERE id = sqlc.arg('id') AND status = 'leased' AND lease_owner = sqlc.arg('owner')::text
+   AND lease_token = sqlc.arg('token')::bigint
 RETURNING *;
 
 -- name: FailJob :one
@@ -92,6 +99,7 @@ UPDATE jobs
        last_error = sqlc.narg('cause'),
        updated_at = now()
  WHERE id = sqlc.arg('id') AND status = 'leased' AND lease_owner = sqlc.arg('owner')::text
+   AND lease_token = sqlc.arg('token')::bigint
 RETURNING *;
 
 -- name: SelectExpiredLeases :many

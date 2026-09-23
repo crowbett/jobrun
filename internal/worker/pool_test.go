@@ -243,40 +243,120 @@ func TestJobTimeoutCancelsAndFails(t *testing.T) {
 	}
 }
 
-func TestHeartbeatDropCancelsHandler(t *testing.T) {
+// TestHeartbeatVerdicts drives each heartbeat outcome through a handler that
+// blocks on ctx and then returns (ctx.Err() or, for a misbehaving handler,
+// nil): kept leases complete with their fencing token, a cancel request ends
+// in Fail -> cancelled, and a lost lease - reported by the store or detected
+// locally because heartbeats kept failing until the lease would expire - is
+// fenced: the handler ctx is cancelled and neither Complete nor Fail is ever
+// called, even when the handler claims success.
+func TestHeartbeatVerdicts(t *testing.T) {
 	t.Parallel()
-	store := newFakeStore()
-	reg := registry(t, "hb", job.HandlerFunc(func(ctx context.Context, _ job.Job) error {
-		<-ctx.Done()
-		return ctx.Err()
-	}))
-	j := newJob("hb")
-	store.mu.Lock()
-	store.drop[j.ID] = true // the store stops keeping the lease on the first heartbeat
-	store.lost[j.ID] = true // and Fail comes back ErrLeaseLost
-	store.mu.Unlock()
-	store.add(j)
-	p := NewPool(store, nil, reg, nil, nil, fastConfig())
-	startPool(t, p)
+	type verdict int
+	const (
+		kept verdict = iota
+		cancelReq
+		lost
+		unreachable
+	)
+	tests := []struct {
+		name      string
+		verdict   verdict
+		ignoreCtx bool // handler returns nil after ctx is done (pretends it succeeded)
+		wantFence bool
+		wantFail  job.Status
+		wantDone  bool // Complete called
+		maxCancel time.Duration
+	}{
+		{name: "kept completes with token", verdict: kept, wantDone: true},
+		{name: "cancel requested fails cancelled", verdict: cancelReq, wantFail: job.StatusCancelled, maxCancel: time.Second},
+		{name: "lost is fenced", verdict: lost, wantFence: true, maxCancel: time.Second},
+		{name: "lost is fenced even if the handler says ok", verdict: lost, ignoreCtx: true, wantFence: true, maxCancel: time.Second},
+		{name: "unreachable store fences at the local deadline", verdict: unreachable, wantFence: true, maxCancel: 2 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store := newFakeStore()
+			cancelled := make(chan time.Duration, 1)
+			var started time.Time
+			reg := registry(t, "hb", job.HandlerFunc(func(ctx context.Context, _ job.Job) error {
+				started = time.Now()
+				if tc.verdict == kept {
+					time.Sleep(50 * time.Millisecond) // a few heartbeats land
+					return nil
+				}
+				<-ctx.Done()
+				cancelled <- time.Since(started)
+				if tc.ignoreCtx {
+					return nil
+				}
+				return ctx.Err()
+			}))
+			j := newJob("hb")
+			store.mu.Lock()
+			switch tc.verdict {
+			case kept:
+			case cancelReq:
+				store.cancelled[j.ID] = true
+			case lost:
+				store.drop[j.ID] = true
+			case unreachable:
+				store.hbErr = errors.New("connection refused")
+			}
+			store.mu.Unlock()
+			store.add(j)
+			cfg := fastConfig()
+			if tc.verdict == unreachable {
+				cfg.LeaseTTL, cfg.HeartbeatEvery = 600*time.Millisecond, 100*time.Millisecond
+			}
+			p := NewPool(store, nil, reg, nil, nil, cfg)
+			stop := startPool(t, p)
 
-	hb := recv(t, store.heartbeats, "heartbeat")
-	if hb.Owner != "test-owner" || len(hb.IDs) != 1 || hb.IDs[0] != j.ID || len(hb.Kept) != 0 {
-		t.Fatalf("heartbeat = %+v", hb)
-	}
-	if hb.Until.Before(time.Now().Add(500 * time.Millisecond)) {
-		t.Fatalf("heartbeat until %v is not ~LeaseTTL ahead", hb.Until)
-	}
-	f := recv(t, store.fails, "fail")
-	if !strings.Contains(f.Cause, "lease lost or cancel requested") {
-		t.Fatalf("fail = %+v", f)
-	}
-	// Give the goroutine a moment to record the ErrLeaseLost answer.
-	deadline := time.Now().Add(2 * time.Second)
-	for p.Stats().LeaseLost != 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if st := p.Stats(); st.LeaseLost != 1 || st.Retried != 0 || st.Dead != 0 {
-		t.Fatalf("stats = %+v", st)
+			if tc.maxCancel > 0 {
+				took := recv(t, cancelled, "handler ctx cancelled")
+				if took > tc.maxCancel {
+					t.Fatalf("handler ctx cancelled after %v, want <= %v", took, tc.maxCancel)
+				}
+				if tc.verdict == unreachable && took < cfg.LeaseTTL-2*cfg.HeartbeatEvery {
+					t.Fatalf("fenced after %v: earlier than the local deadline (ttl %v - hb %v)", took, cfg.LeaseTTL, cfg.HeartbeatEvery)
+				}
+			}
+			switch {
+			case tc.wantDone:
+				c := recv(t, store.completes, "complete")
+				if c.Token != 1 || c.Owner != "test-owner" {
+					t.Fatalf("complete = %+v, want token 1 owner test-owner", c)
+				}
+			case tc.wantFail != job.StatusUnspecified:
+				f := recv(t, store.fails, "fail")
+				if f.Status != tc.wantFail || f.Token != 1 || !strings.Contains(f.Cause, "cancel requested") {
+					t.Fatalf("fail = %+v", f)
+				}
+			}
+			if tc.wantFence {
+				expectNone(t, store.completes, 100*time.Millisecond, "complete of a fenced job")
+				expectNone(t, store.fails, 10*time.Millisecond, "fail of a fenced job")
+			}
+			if err := stop(); err != nil {
+				t.Fatal(err)
+			}
+			st := p.Stats()
+			wantFenced := int64(0)
+			if tc.wantFence {
+				wantFenced = 1
+			}
+			if st.Fenced != wantFenced || st.LeaseLost != 0 || st.Retried != 0 || st.Dead != 0 {
+				t.Fatalf("stats = %+v, want fenced %d", st, wantFenced)
+			}
+			hb := recv(t, store.heartbeats, "heartbeat")
+			if hb.Owner != "test-owner" || len(hb.IDs) != 1 || hb.IDs[0] != j.ID || hb.Tokens[0] != 1 {
+				t.Fatalf("heartbeat = %+v", hb)
+			}
+			if hb.Until.Before(time.Now().Add(-5 * time.Second)) {
+				t.Fatalf("heartbeat until %v is not ~LeaseTTL ahead", hb.Until)
+			}
+		})
 	}
 }
 
@@ -290,7 +370,6 @@ func TestCooperativeCancelIsNotCountedAsRetry(t *testing.T) {
 	}))
 	j := newJob("cancel")
 	store.mu.Lock()
-	store.drop[j.ID] = true
 	store.cancelled[j.ID] = true
 	store.mu.Unlock()
 	store.add(j)
@@ -309,7 +388,29 @@ func TestCooperativeCancelIsNotCountedAsRetry(t *testing.T) {
 	if len(ev) != 2 || ev[1].To != job.StatusCancelled {
 		t.Fatalf("events = %+v", ev)
 	}
-	if st := p.Stats(); st.Retried != 0 || st.Dead != 0 || st.Failed != 1 {
+	if st := p.Stats(); st.Retried != 0 || st.Dead != 0 || st.Failed != 1 || st.Fenced != 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+}
+
+// TestLostLeaseOnCompleteIsCounted: the store rejects Complete (the lease was
+// lost between the last heartbeat and the completion) - counted, not retried.
+func TestLostLeaseOnCompleteIsCounted(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	reg := registry(t, "ok", job.HandlerFunc(func(context.Context, job.Job) error { return nil }))
+	j := newJob("ok")
+	store.mu.Lock()
+	store.lost[j.ID] = true
+	store.mu.Unlock()
+	store.add(j)
+	p := NewPool(store, nil, reg, nil, nil, fastConfig())
+	stop := startPool(t, p)
+	recv(t, store.completes, "complete")
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if st := p.Stats(); st.LeaseLost != 1 || st.Succeeded != 0 || st.Fenced != 0 {
 		t.Fatalf("stats = %+v", st)
 	}
 }
@@ -505,5 +606,44 @@ func TestConfigDefaults(t *testing.T) {
 	c = Config{LeaseTTL: 3 * time.Second, HeartbeatEvery: 10 * time.Second}.withDefaults()
 	if c.HeartbeatEvery != time.Second {
 		t.Fatalf("HeartbeatEvery = %v, want LeaseTTL/3", c.HeartbeatEvery)
+	}
+}
+
+// TestReclaimedJobFencesOnlyTheOldLease: the pool holds two leases of the same
+// job at once - its first attempt was reaped and it reclaimed the job with a
+// newer token. The heartbeat drops only the old lease: that handler is fenced
+// and never reported, the new one completes with its own token.
+func TestReclaimedJobFencesOnlyTheOldLease(t *testing.T) {
+	t.Parallel()
+	store := newFakeStore()
+	reg := registry(t, "twice", job.HandlerFunc(func(ctx context.Context, j job.Job) error {
+		if j.LeaseToken == 1 {
+			<-ctx.Done()
+			return nil // claims success after being fenced
+		}
+		time.Sleep(50 * time.Millisecond) // let the old lease be fenced first
+		return nil
+	}))
+	first := newJob("twice")
+	second := first
+	second.LeaseToken = 1 // the reclaim: Claim bumps it to 2
+	store.mu.Lock()
+	store.dropLease[job.Lease{ID: first.ID, Token: 1}] = true
+	store.mu.Unlock()
+	store.add(first, second)
+	p := NewPool(store, nil, reg, nil, nil, fastConfig())
+	stop := startPool(t, p)
+
+	c := recv(t, store.completes, "complete")
+	if c.ID != first.ID || c.Token != 2 {
+		t.Fatalf("complete = %+v, want token 2", c)
+	}
+	expectNone(t, store.completes, 100*time.Millisecond, "complete of the fenced lease")
+	expectNone(t, store.fails, 10*time.Millisecond, "fail of the fenced lease")
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if st := p.Stats(); st.Fenced != 1 || st.Succeeded != 1 {
+		t.Fatalf("stats = %+v", st)
 	}
 }

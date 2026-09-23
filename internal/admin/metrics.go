@@ -88,6 +88,7 @@ func (h *metricsHandler) render(b *bytes.Buffer) {
 		}
 		e.counter("jobrun_dead_total", "Jobs that reached the dead state (attempts exhausted or permanent failure).", c.Dead)
 		e.counter("jobrun_lease_expired_total", "Leases the reaper found expired and requeued or killed.", c.LeaseExpired)
+		e.counter("jobrun_lease_fenced_total", "Handlers cancelled because a heartbeat found their lease lost; never completed.", c.LeaseFenced)
 		e.counter("jobrun_scheduler_ticks_total", "Scheduler ticks run by this process while it held the leader lock.", c.SchedulerTicks)
 	}
 	if h.hist != nil {

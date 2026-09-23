@@ -138,6 +138,7 @@ func insertParams(j job.Job) (sqlc.InsertJobParams, error) {
 		MaxAttempts:    maxAttempts,
 		Backoff:        backoff,
 		IdempotencyKey: nullStr(j.IdempotencyKey),
+		Traceparent:    nullStr(j.TraceParent),
 	}
 	if !j.RunAt.IsZero() {
 		runAt := j.RunAt
@@ -237,6 +238,7 @@ func (s *Store) EnqueueBatch(ctx context.Context, js []job.Job) (int64, error) {
 			rows = append(rows, sqlc.InsertJobsCopyParams{
 				ID: p.ID, Queue: p.Queue, Type: p.Type, Payload: p.Payload, Priority: p.Priority,
 				RunAt: runAt, MaxAttempts: p.MaxAttempts, Backoff: p.Backoff, IdempotencyKey: p.IdempotencyKey,
+				Traceparent: p.Traceparent,
 			})
 			evs = append(evs, job.Event{JobID: p.ID, Queue: p.Queue, Type: p.Type, To: job.StatusQueued, At: now})
 			queues[p.Queue] = struct{}{}
@@ -293,25 +295,33 @@ func (s *Store) Claim(ctx context.Context, q job.ClaimQuery) ([]job.Job, error) 
 	return out, err
 }
 
-// Heartbeat extends the unexpired leases of ids owned by owner to until and
-// returns the ids kept whose cancel is not requested. Missing ids mean the
-// lease expired, was reaped or stolen, or the job was cancelled: the worker
-// cancels those contexts.
-func (s *Store) Heartbeat(ctx context.Context, owner string, ids []job.ID, until time.Time) ([]job.ID, error) {
-	if len(ids) == 0 {
-		return []job.ID{}, nil
+// Heartbeat extends the unexpired leases held by owner whose fencing token
+// still matches to until, and splits them into kept and cancel-requested. A
+// lease in neither list expired, was reaped, or was claimed again (a newer
+// token): the worker fences it.
+func (s *Store) Heartbeat(ctx context.Context, owner string, leases []job.Lease, until time.Time) (job.Renewal, error) {
+	out := job.Renewal{Kept: []job.Lease{}, CancelRequested: []job.Lease{}}
+	if len(leases) == 0 {
+		return out, nil
 	}
-	rows, err := s.q.HeartbeatLeases(ctx, sqlc.HeartbeatLeasesParams{Until: until, Ids: ids, Owner: owner})
+	ids := make([]job.ID, len(leases))
+	tokens := make([]int64, len(leases))
+	for i, l := range leases {
+		ids[i], tokens[i] = l.ID, l.Token
+	}
+	rows, err := s.q.HeartbeatLeases(ctx, sqlc.HeartbeatLeasesParams{Until: until, Ids: ids, Tokens: tokens, Owner: owner})
 	if err != nil {
-		return nil, fmt.Errorf("heartbeat leases: %w", err)
+		return job.Renewal{}, fmt.Errorf("heartbeat leases: %w", err)
 	}
-	kept := make([]job.ID, 0, len(rows))
 	for _, r := range rows {
-		if !r.CancelRequested {
-			kept = append(kept, r.ID)
+		l := job.Lease{ID: r.ID, Token: r.LeaseToken}
+		if r.CancelRequested {
+			out.CancelRequested = append(out.CancelRequested, l)
+			continue
 		}
+		out.Kept = append(out.Kept, l)
 	}
-	return kept, nil
+	return out, nil
 }
 
 // txExecer is the slice of the completion transaction handed to a Commit closure.
@@ -326,11 +336,12 @@ func (e txExecer) Exec(ctx context.Context, sql string, args ...any) (int64, err
 }
 
 // Complete finishes a leased job in one transaction: lock the row and check
-// the owner (job.ErrLeaseLost otherwise), insert the processed_effects row, run
+// the owner and fencing token (job.ErrLeaseLost otherwise), insert the processed_effects row, run
 // fn when the effect is new, flip the job to succeeded (or cancelled when a
 // cancel was requested meanwhile) and record the event. Zero rows on the
 // owner-guarded update rolls everything back, fn's writes included.
-func (s *Store) Complete(ctx context.Context, id job.ID, owner string, fn job.Commit) error {
+func (s *Store) Complete(ctx context.Context, l job.Lease, owner string, fn job.Commit) error {
+	id := l.ID
 	return s.withTx(ctx, func(q *sqlc.Queries, tx pgx.Tx) error {
 		if s.commitTimeout > 0 {
 			ms := strconv.FormatInt(s.commitTimeout.Milliseconds(), 10)
@@ -346,8 +357,9 @@ func (s *Store) Complete(ctx context.Context, id job.ID, owner string, fn job.Co
 		if err != nil {
 			return err
 		}
-		if cur.Status != job.StatusLeased || cur.LeaseOwner != owner {
-			return fmt.Errorf("%w: job %s is %s (owner %q)", job.ErrLeaseLost, id, cur.Status, cur.LeaseOwner)
+		if cur.Status != job.StatusLeased || cur.LeaseOwner != owner || cur.LeaseToken != l.Token {
+			return fmt.Errorf("%w: job %s is %s (owner %q, token %d, presented %d)",
+				job.ErrLeaseLost, id, cur.Status, cur.LeaseOwner, cur.LeaseToken, l.Token)
 		}
 		fresh, err := markEffect(ctx, q, cur)
 		if err != nil {
@@ -358,7 +370,7 @@ func (s *Store) Complete(ctx context.Context, id job.ID, owner string, fn job.Co
 				return fmt.Errorf("commit effect: %w", err)
 			}
 		}
-		done, err := q.CompleteJob(ctx, sqlc.CompleteJobParams{ID: id, Owner: owner})
+		done, err := q.CompleteJob(ctx, sqlc.CompleteJobParams{ID: id, Owner: owner, Token: l.Token})
 		if err != nil {
 			return mapNotFound(err, job.ErrLeaseLost, "complete job")
 		}
@@ -375,12 +387,14 @@ func (s *Store) Complete(ctx context.Context, id job.ID, owner string, fn job.Co
 
 // Fail records cause and moves the job to queued at retryAt, to dead when perm
 // is set or attempts reached max_attempts, or to cancelled when a cancel was
-// requested; it returns the resulting status. Owner-guarded (job.ErrLeaseLost).
-func (s *Store) Fail(ctx context.Context, id job.ID, owner, cause string, perm bool, retryAt time.Time) (job.Status, error) {
+// requested; it returns the resulting status. Owner- and token-guarded
+// (job.ErrLeaseLost).
+func (s *Store) Fail(ctx context.Context, l job.Lease, owner, cause string, perm bool, retryAt time.Time) (job.Status, error) {
+	id := l.ID
 	var to job.Status
 	err := s.withTx(ctx, func(q *sqlc.Queries, _ pgx.Tx) error {
 		row, err := q.FailJob(ctx, sqlc.FailJobParams{
-			ID: id, Owner: owner, Permanent: perm, RetryAt: retryAt, Cause: nullStr(truncateErr(cause)),
+			ID: id, Owner: owner, Token: l.Token, Permanent: perm, RetryAt: retryAt, Cause: nullStr(truncateErr(cause)),
 		})
 		if err != nil {
 			return mapNotFound(err, job.ErrLeaseLost, "fail job")

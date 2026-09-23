@@ -10,6 +10,7 @@ import (
 
 	jobrunv1 "github.com/crowbett/jobrun/gen/jobrun/v1"
 	"github.com/crowbett/jobrun/internal/job"
+	"github.com/crowbett/jobrun/internal/obs"
 )
 
 // JobServer implements jobrunv1.JobServiceServer on top of Jobs.
@@ -50,7 +51,12 @@ func (s *JobServer) Register(reg grpc.ServiceRegistrar) {
 
 // Enqueue inserts one job. A replay of (queue, idempotency_key) returns the
 // stored job with created=false.
-func (s *JobServer) Enqueue(ctx context.Context, req *jobrunv1.EnqueueRequest) (*jobrunv1.EnqueueResponse, error) {
+//
+// It opens the jobrun.enqueue producer span (a child of the caller's trace when
+// the gRPC stats handler extracted one) and stores its W3C traceparent with the
+// job, so the run span - in-process or on a remote worker - joins the same
+// trace. The trace context is captured at write time or the trace breaks.
+func (s *JobServer) Enqueue(ctx context.Context, req *jobrunv1.EnqueueRequest) (resp *jobrunv1.EnqueueResponse, err error) {
 	n, err := newJobFromProto(req)
 	if err != nil {
 		return nil, toStatus(ctx, s.log, "Enqueue", err)
@@ -59,6 +65,9 @@ func (s *JobServer) Enqueue(ctx context.Context, req *jobrunv1.EnqueueRequest) (
 	if err != nil {
 		return nil, toStatus(ctx, s.log, "Enqueue", err)
 	}
+	ctx, span := obs.StartEnqueue(ctx, j)
+	defer func() { obs.End(span, err) }()
+	j.TraceParent = obs.TraceParent(ctx)
 	stored, err := s.jobs.Enqueue(ctx, j)
 	if err != nil {
 		return nil, toStatus(ctx, s.log, "Enqueue", err)

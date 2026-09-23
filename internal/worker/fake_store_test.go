@@ -17,10 +17,12 @@ type fakeStore struct {
 	mu        sync.Mutex
 	ready     map[string][]job.Job // claimable per queue, FIFO
 	claims    []job.ClaimQuery
-	claimErrs int             // claims left that fail with errClaim
-	drop      map[job.ID]bool // heartbeat stops keeping these
-	lost      map[job.ID]bool // Complete/Fail answer ErrLeaseLost
-	cancelled map[job.ID]bool // Fail answers StatusCancelled (cooperative cancel landed)
+	claimErrs int                // claims left that fail with errClaim
+	drop      map[job.ID]bool    // heartbeat reports these lost
+	lost      map[job.ID]bool    // Complete/Fail answer ErrLeaseLost
+	cancelled map[job.ID]bool    // heartbeat reports cancel requested; Fail answers StatusCancelled
+	dropLease map[job.Lease]bool // heartbeat reports this one lease lost
+	hbErr     error              // every heartbeat fails with this when set
 
 	completes  chan completeCall
 	fails      chan failCall
@@ -29,12 +31,14 @@ type fakeStore struct {
 
 type completeCall struct {
 	ID     job.ID
+	Token  int64
 	Owner  string
 	Commit job.Commit
 }
 
 type failCall struct {
 	ID      job.ID
+	Token   int64
 	Owner   string
 	Cause   string
 	Perm    bool
@@ -43,10 +47,13 @@ type failCall struct {
 }
 
 type heartbeatCall struct {
-	Owner string
-	IDs   []job.ID
-	Until time.Time
-	Kept  []job.ID
+	Owner   string
+	IDs     []job.ID
+	Tokens  []int64
+	Until   time.Time
+	Kept    []job.Lease
+	Cancels []job.Lease
+	Err     error
 }
 
 var errClaim = claimError{}
@@ -59,6 +66,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		ready:      make(map[string][]job.Job),
 		drop:       make(map[job.ID]bool),
+		dropLease:  make(map[job.Lease]bool),
 		lost:       make(map[job.ID]bool),
 		cancelled:  make(map[job.ID]bool),
 		completes:  make(chan completeCall, 1024),
@@ -102,37 +110,51 @@ func (f *fakeStore) Claim(_ context.Context, q job.ClaimQuery) ([]job.Job, error
 		j.LeaseOwner = q.Owner
 		j.LeaseUntil = &until
 		j.Attempts++
+		j.LeaseToken++
 		out = append(out, j)
 	}
 	f.ready[q.Queue] = pending[n:]
 	return out, nil
 }
 
-func (f *fakeStore) Heartbeat(_ context.Context, owner string, ids []job.ID, until time.Time) ([]job.ID, error) {
+func (f *fakeStore) Heartbeat(_ context.Context, owner string, leases []job.Lease, until time.Time) (job.Renewal, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	kept := make([]job.ID, 0, len(ids))
-	for _, id := range ids {
-		if !f.drop[id] {
-			kept = append(kept, id)
+	call := heartbeatCall{Owner: owner, Until: until, Err: f.hbErr}
+	for _, l := range leases {
+		call.IDs = append(call.IDs, l.ID)
+		call.Tokens = append(call.Tokens, l.Token)
+	}
+	if f.hbErr != nil {
+		f.heartbeats <- call
+		return job.Renewal{}, f.hbErr
+	}
+	for _, l := range leases {
+		switch {
+		case f.cancelled[l.ID]:
+			call.Cancels = append(call.Cancels, l)
+		case !f.drop[l.ID] && !f.dropLease[l]:
+			call.Kept = append(call.Kept, l)
 		}
 	}
-	f.heartbeats <- heartbeatCall{Owner: owner, IDs: ids, Until: until, Kept: kept}
-	return kept, nil
+	f.heartbeats <- call
+	return job.Renewal{Kept: call.Kept, CancelRequested: call.Cancels}, nil
 }
 
-func (f *fakeStore) Complete(_ context.Context, id job.ID, owner string, fn job.Commit) error {
+func (f *fakeStore) Complete(_ context.Context, l job.Lease, owner string, fn job.Commit) error {
+	id := l.ID
 	f.mu.Lock()
 	lost := f.lost[id]
 	f.mu.Unlock()
-	f.completes <- completeCall{ID: id, Owner: owner, Commit: fn}
+	f.completes <- completeCall{ID: id, Token: l.Token, Owner: owner, Commit: fn}
 	if lost {
 		return job.ErrLeaseLost
 	}
 	return nil
 }
 
-func (f *fakeStore) Fail(_ context.Context, id job.ID, owner, cause string, perm bool, retryAt time.Time) (job.Status, error) {
+func (f *fakeStore) Fail(_ context.Context, l job.Lease, owner, cause string, perm bool, retryAt time.Time) (job.Status, error) {
+	id := l.ID
 	f.mu.Lock()
 	lost, cancelled := f.lost[id], f.cancelled[id]
 	f.mu.Unlock()
@@ -145,7 +167,7 @@ func (f *fakeStore) Fail(_ context.Context, id job.ID, owner, cause string, perm
 	case perm:
 		status = job.StatusDead
 	}
-	f.fails <- failCall{ID: id, Owner: owner, Cause: cause, Perm: perm, RetryAt: retryAt, Status: status}
+	f.fails <- failCall{ID: id, Token: l.Token, Owner: owner, Cause: cause, Perm: perm, RetryAt: retryAt, Status: status}
 	if lost {
 		return job.StatusUnspecified, job.ErrLeaseLost
 	}

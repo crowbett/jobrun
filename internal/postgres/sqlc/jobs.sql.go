@@ -17,7 +17,7 @@ const cancelQueuedJob = `-- name: CancelQueuedJob :one
 UPDATE jobs
    SET status = 'cancelled', finished_at = now(), updated_at = now()
  WHERE id = $1 AND status = 'queued'
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 func (q *Queries) CancelQueuedJob(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -43,6 +43,8 @@ func (q *Queries) CancelQueuedJob(ctx context.Context, id uuid.UUID) (Job, error
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
@@ -60,11 +62,12 @@ UPDATE jobs AS j
        lease_owner = $1::text,
        lease_until = now() + $2::interval,
        attempts = j.attempts + 1,
+       lease_token = j.lease_token + 1,
        started_at = COALESCE(j.started_at, now()),
        updated_at = now()
   FROM ready
  WHERE j.id = ready.id
-RETURNING j.id, j.queue, j.type, j.payload, j.status, j.priority, j.run_at, j.attempts, j.max_attempts, j.backoff, j.lease_owner, j.lease_until, j.last_error, j.idempotency_key, j.cancel_requested, j.created_at, j.updated_at, j.started_at, j.finished_at
+RETURNING j.id, j.queue, j.type, j.payload, j.status, j.priority, j.run_at, j.attempts, j.max_attempts, j.backoff, j.lease_owner, j.lease_until, j.last_error, j.idempotency_key, j.cancel_requested, j.created_at, j.updated_at, j.started_at, j.finished_at, j.lease_token, j.traceparent
 `
 
 type ClaimJobsParams struct {
@@ -76,7 +79,8 @@ type ClaimJobsParams struct {
 
 // One round trip = batch claim + lease + attempts++. The CTE takes the row locks
 // (SKIP LOCKED, so concurrent claimers never wait on each other) and the UPDATE
-// flips them to leased. started_at is the first claim; attempts counts starts.
+// flips them to leased. started_at is the first claim; attempts counts starts;
+// lease_token is bumped so every claim carries a fresh fencing token.
 func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]Job, error) {
 	rows, err := q.db.Query(ctx, claimJobs,
 		arg.Owner,
@@ -111,6 +115,8 @@ func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]Job, er
 			&i.UpdatedAt,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.LeaseToken,
+			&i.Traceparent,
 		); err != nil {
 			return nil, err
 		}
@@ -128,18 +134,21 @@ UPDATE jobs
        lease_owner = NULL, lease_until = NULL, last_error = NULL,
        finished_at = now(), updated_at = now()
  WHERE id = $1 AND status = 'leased' AND lease_owner = $2::text
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+   AND lease_token = $3::bigint
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 type CompleteJobParams struct {
 	ID    uuid.UUID
 	Owner string
+	Token int64
 }
 
-// Owner-guarded so a stale worker cannot resurrect a reaped job. A job whose cancel
-// was requested while it ran ends cancelled, not succeeded. No row = ErrLeaseLost.
+// Owner- and token-guarded so a stale worker cannot resurrect a reaped job. A job
+// whose cancel was requested while it ran ends cancelled, not succeeded. No row =
+// ErrLeaseLost.
 func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (Job, error) {
-	row := q.db.QueryRow(ctx, completeJob, arg.ID, arg.Owner)
+	row := q.db.QueryRow(ctx, completeJob, arg.ID, arg.Owner, arg.Token)
 	var i Job
 	err := row.Scan(
 		&i.ID,
@@ -161,6 +170,8 @@ func (q *Queries) CompleteJob(ctx context.Context, arg CompleteJobParams) (Job, 
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
@@ -195,7 +206,8 @@ UPDATE jobs
        last_error = $3,
        updated_at = now()
  WHERE id = $4 AND status = 'leased' AND lease_owner = $5::text
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+   AND lease_token = $6::bigint
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 type FailJobParams struct {
@@ -204,6 +216,7 @@ type FailJobParams struct {
 	Cause     *string
 	ID        uuid.UUID
 	Owner     string
+	Token     int64
 }
 
 // retry_at is computed in Go from job.Policy (the single source of backoff truth).
@@ -215,6 +228,7 @@ func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (Job, error) {
 		arg.Cause,
 		arg.ID,
 		arg.Owner,
+		arg.Token,
 	)
 	var i Job
 	err := row.Scan(
@@ -237,12 +251,14 @@ func (q *Queries) FailJob(ctx context.Context, arg FailJobParams) (Job, error) {
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
 
 const getJob = `-- name: GetJob :one
-SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at FROM jobs WHERE id = $1
+SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent FROM jobs WHERE id = $1
 `
 
 func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -268,12 +284,14 @@ func (q *Queries) GetJob(ctx context.Context, id uuid.UUID) (Job, error) {
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
 
 const getJobByIdem = `-- name: GetJobByIdem :one
-SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at FROM jobs WHERE queue = $1 AND idempotency_key = $2::text
+SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent FROM jobs WHERE queue = $1 AND idempotency_key = $2::text
 `
 
 type GetJobByIdemParams struct {
@@ -304,12 +322,14 @@ func (q *Queries) GetJobByIdem(ctx context.Context, arg GetJobByIdemParams) (Job
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
 
 const getJobForUpdate = `-- name: GetJobForUpdate :one
-SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at FROM jobs WHERE id = $1 FOR UPDATE
+SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent FROM jobs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) GetJobForUpdate(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -335,36 +355,48 @@ func (q *Queries) GetJobForUpdate(ctx context.Context, id uuid.UUID) (Job, error
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
 
 const heartbeatLeases = `-- name: HeartbeatLeases :many
-UPDATE jobs
+UPDATE jobs AS j
    SET lease_until = $1::timestamptz, updated_at = now()
- WHERE id = ANY($2::uuid[])
-   AND status = 'leased'
-   AND lease_owner = $3::text
-   AND lease_until > now()
-RETURNING id, cancel_requested
+  FROM (SELECT unnest($3::uuid[]) AS id, unnest($4::bigint[]) AS token) AS l
+ WHERE j.id = l.id
+   AND j.lease_token = l.token
+   AND j.status = 'leased'
+   AND j.lease_owner = $2::text
+   AND j.lease_until > now()
+RETURNING j.id, j.lease_token, j.cancel_requested
 `
 
 type HeartbeatLeasesParams struct {
-	Until time.Time
-	Ids   []uuid.UUID
-	Owner string
+	Until  time.Time
+	Owner  string
+	Ids    []uuid.UUID
+	Tokens []int64
 }
 
 type HeartbeatLeasesRow struct {
 	ID              uuid.UUID
+	LeaseToken      int64
 	CancelRequested bool
 }
 
-// Returns the ids actually extended. A lease that already expired is not revived
+// Returns the leases actually extended: (id, token) pairs zipped by the parallel
+// unnest, guarded by owner and token. A lease that already expired is not revived
 // (fencing: once lease_until has passed the reaper may take the job at any moment),
-// and cancel_requested is returned so the store can omit cancelled ids from kept.
+// and cancel_requested is returned so the store can report cancelled ids apart.
 func (q *Queries) HeartbeatLeases(ctx context.Context, arg HeartbeatLeasesParams) ([]HeartbeatLeasesRow, error) {
-	rows, err := q.db.Query(ctx, heartbeatLeases, arg.Until, arg.Ids, arg.Owner)
+	rows, err := q.db.Query(ctx, heartbeatLeases,
+		arg.Until,
+		arg.Owner,
+		arg.Ids,
+		arg.Tokens,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +404,7 @@ func (q *Queries) HeartbeatLeases(ctx context.Context, arg HeartbeatLeasesParams
 	items := []HeartbeatLeasesRow{}
 	for rows.Next() {
 		var i HeartbeatLeasesRow
-		if err := rows.Scan(&i.ID, &i.CancelRequested); err != nil {
+		if err := rows.Scan(&i.ID, &i.LeaseToken, &i.CancelRequested); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -385,14 +417,14 @@ func (q *Queries) HeartbeatLeases(ctx context.Context, arg HeartbeatLeasesParams
 
 const insertJob = `-- name: InsertJob :one
 
-INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key)
+INSERT INTO jobs (id, queue, type, payload, priority, run_at, max_attempts, backoff, idempotency_key, traceparent)
 VALUES (
     $1, $2, $3, $4, $5,
     COALESCE($6::timestamptz, now() + $7::interval),
-    $8, $9, $10
+    $8, $9, $10, $11
 )
 ON CONFLICT (queue, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 type InsertJobParams struct {
@@ -406,6 +438,7 @@ type InsertJobParams struct {
 	MaxAttempts    int32
 	Backoff        []byte
 	IdempotencyKey *string
+	Traceparent    *string
 }
 
 // Every time comparison and default below uses the database clock (now()), never a
@@ -425,6 +458,7 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (Job, erro
 		arg.MaxAttempts,
 		arg.Backoff,
 		arg.IdempotencyKey,
+		arg.Traceparent,
 	)
 	var i Job
 	err := row.Scan(
@@ -447,6 +481,8 @@ func (q *Queries) InsertJob(ctx context.Context, arg InsertJobParams) (Job, erro
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
@@ -461,10 +497,11 @@ type InsertJobsCopyParams struct {
 	MaxAttempts    int32
 	Backoff        []byte
 	IdempotencyKey *string
+	Traceparent    *string
 }
 
 const listJobs = `-- name: ListJobs :many
-SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at FROM jobs
+SELECT id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent FROM jobs
  WHERE ($1::text IS NULL OR queue = $1::text)
    AND ($2::job_status IS NULL OR status = $2::job_status)
    AND ($3::text IS NULL OR type = $3::text)
@@ -521,6 +558,8 @@ func (q *Queries) ListJobs(ctx context.Context, arg ListJobsParams) ([]Job, erro
 			&i.UpdatedAt,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.LeaseToken,
+			&i.Traceparent,
 		); err != nil {
 			return nil, err
 		}
@@ -625,7 +664,7 @@ const requestCancel = `-- name: RequestCancel :one
 UPDATE jobs
    SET cancel_requested = true, updated_at = now()
  WHERE id = $1 AND status = 'leased'
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 func (q *Queries) RequestCancel(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -651,6 +690,8 @@ func (q *Queries) RequestCancel(ctx context.Context, id uuid.UUID) (Job, error) 
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }
@@ -661,7 +702,7 @@ UPDATE jobs
        lease_owner = NULL, lease_until = NULL, cancel_requested = false,
        last_error = NULL, finished_at = NULL, updated_at = now()
  WHERE id = $1 AND status IN ('dead', 'cancelled', 'failed')
-RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, queue, type, payload, status, priority, run_at, attempts, max_attempts, backoff, lease_owner, lease_until, last_error, idempotency_key, cancel_requested, created_at, updated_at, started_at, finished_at, lease_token, traceparent
 `
 
 func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID) (Job, error) {
@@ -687,6 +728,8 @@ func (q *Queries) RetryJob(ctx context.Context, id uuid.UUID) (Job, error) {
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.LeaseToken,
+		&i.Traceparent,
 	)
 	return i, err
 }

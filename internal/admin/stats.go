@@ -36,6 +36,7 @@ type counters struct {
 	Dead           uint64     `json:"dead"`
 	LeaseExpired   uint64     `json:"lease_expired"`
 	SchedulerTicks uint64     `json:"scheduler_ticks"`
+	LeaseFenced    uint64     `json:"lease_fenced"`
 }
 
 type jobCount struct {
@@ -77,7 +78,7 @@ func (h statsHandler) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 	}
 	if h.d.Counters != nil {
 		c := h.d.Counters()
-		cj := &counters{Jobs: make([]jobCount, 0, len(c.Jobs)), Dead: c.Dead, LeaseExpired: c.LeaseExpired, SchedulerTicks: c.SchedulerTicks}
+		cj := &counters{Jobs: make([]jobCount, 0, len(c.Jobs)), Dead: c.Dead, LeaseExpired: c.LeaseExpired, SchedulerTicks: c.SchedulerTicks, LeaseFenced: c.LeaseFenced}
 		for k, n := range c.Jobs {
 			cj.Jobs = append(cj.Jobs, jobCount{Queue: k.Queue, Status: k.Status, N: n})
 		}

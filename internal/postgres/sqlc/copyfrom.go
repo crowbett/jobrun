@@ -38,6 +38,7 @@ func (r iteratorForInsertJobsCopy) Values() ([]interface{}, error) {
 		r.rows[0].MaxAttempts,
 		r.rows[0].Backoff,
 		r.rows[0].IdempotencyKey,
+		r.rows[0].Traceparent,
 	}, nil
 }
 
@@ -46,5 +47,5 @@ func (r iteratorForInsertJobsCopy) Err() error {
 }
 
 func (q *Queries) InsertJobsCopy(ctx context.Context, arg []InsertJobsCopyParams) (int64, error) {
-	return q.db.CopyFrom(ctx, []string{"jobs"}, []string{"id", "queue", "type", "payload", "priority", "run_at", "max_attempts", "backoff", "idempotency_key"}, &iteratorForInsertJobsCopy{rows: arg})
+	return q.db.CopyFrom(ctx, []string{"jobs"}, []string{"id", "queue", "type", "payload", "priority", "run_at", "max_attempts", "backoff", "idempotency_key", "traceparent"}, &iteratorForInsertJobsCopy{rows: arg})
 }

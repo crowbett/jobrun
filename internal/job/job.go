@@ -50,6 +50,9 @@ type Job struct {
 	// LeaseOwner/LeaseUntil are set while Status == StatusLeased and nil/"" otherwise.
 	LeaseOwner string
 	LeaseUntil *time.Time
+	// LeaseToken is the fencing token of the latest claim: every claim bumps
+	// it, and Heartbeat/Complete/Fail must present it (see Lease).
+	LeaseToken int64
 	LastError  string
 	// IdempotencyKey is optional and unique per queue.
 	IdempotencyKey string
@@ -57,10 +60,13 @@ type Job struct {
 	// through Heartbeat (the id is omitted from the kept set) and cancels the
 	// handler context. The job then ends cancelled even if Complete/Fail arrive.
 	CancelRequested bool
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	StartedAt       *time.Time
-	FinishedAt      *time.Time
+	// TraceParent is the W3C trace context captured at enqueue ("" when the
+	// producer was not traced); the run span is started as its child.
+	TraceParent string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	StartedAt   *time.Time
+	FinishedAt  *time.Time
 }
 
 // NewJob is an enqueue request after transport decoding and before defaults.
@@ -145,6 +151,32 @@ type Schedule struct {
 	LastRun   *time.Time
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// Lease names one claim of one job. Token is the job's LeaseToken as returned
+// by Claim: it is bumped on every claim, so a lease from an earlier attempt -
+// expired, reaped and claimed again, even by the same owner - can never
+// heartbeat, complete or fail the job again.
+type Lease struct {
+	ID    ID
+	Token int64
+}
+
+// LeaseOf returns the lease a claimed job carries.
+func LeaseOf(j Job) Lease { return Lease{ID: j.ID, Token: j.LeaseToken} }
+
+// Renewal is a heartbeat verdict. Kept leases were extended. CancelRequested
+// leases were extended too, but the job was cancelled: the worker stops the
+// handler and still reports it with Fail or Complete (the job ends cancelled).
+// A lease in neither list was lost (expired, reaped, stolen): the worker must
+// cancel the handler and never Complete or Fail it.
+//
+// Verdicts name leases, not job ids: a worker may hold an old and a new lease
+// of the same job at once (it reclaimed its own reaped job), and only the new
+// one is kept.
+type Renewal struct {
+	Kept            []Lease
+	CancelRequested []Lease
 }
 
 // ClaimQuery is one batch claim: up to Limit ready jobs on Queue, leased to

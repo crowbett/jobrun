@@ -78,6 +78,8 @@ type Job struct {
 	UpdatedAt       time.Time
 	StartedAt       *time.Time
 	FinishedAt      *time.Time
+	LeaseToken      int64
+	Traceparent     *string
 }
 
 type JobEvent struct {

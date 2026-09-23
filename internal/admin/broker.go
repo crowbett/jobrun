@@ -40,6 +40,9 @@ type Counters struct {
 	Dead           uint64
 	LeaseExpired   uint64
 	SchedulerTicks uint64
+	// LeaseFenced counts handlers whose lease a heartbeat found gone (in-process
+	// pool plus leases WorkerService reported lost to remote workers).
+	LeaseFenced uint64
 }
 
 // Broker fans job.Event values out to subscribers. Publish never blocks: a

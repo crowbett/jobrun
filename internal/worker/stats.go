@@ -16,12 +16,16 @@ type Stats struct {
 	Dead int64
 	// LeaseLost is the number of Complete/Fail calls rejected with ErrLeaseLost.
 	LeaseLost int64
+	// Fenced is the number of handlers cancelled because a heartbeat found
+	// their lease gone (or it could not be renewed in time); their result was
+	// dropped without calling Complete or Fail.
+	Fenced int64
 	// InFlight is the number of handlers running right now.
 	InFlight int64
 }
 
 type counters struct {
-	claimed, succeeded, failed, retried, dead, leaseLost, inFlight atomic.Int64
+	claimed, succeeded, failed, retried, dead, leaseLost, fenced, inFlight atomic.Int64
 }
 
 func (c *counters) snapshot() Stats {
@@ -32,6 +36,7 @@ func (c *counters) snapshot() Stats {
 		Retried:   c.retried.Load(),
 		Dead:      c.dead.Load(),
 		LeaseLost: c.leaseLost.Load(),
+		Fenced:    c.fenced.Load(),
 		InFlight:  c.inFlight.Load(),
 	}
 }

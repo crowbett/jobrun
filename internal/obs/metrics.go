@@ -19,19 +19,24 @@ const MeterName = "jobrun"
 // The same values feed the OTel observable instruments here and the
 // hand-written /metrics text in internal/admin, so the two cannot disagree.
 type Snapshot struct {
-	Claimed        uint64 // jobs leased by this process
-	Succeeded      uint64 // Complete committed
-	Failed         uint64 // handler returned an error (retried or dead)
-	Retried        uint64 // failures that went back to queued
-	Dead           uint64 // failures that ended dead
-	LeaseLost      uint64 // Complete/Fail after the lease was reaped or cancelled
+	Claimed   uint64 // jobs leased by this process
+	Succeeded uint64 // Complete committed
+	Failed    uint64 // handler returned an error (retried or dead)
+	Retried   uint64 // failures that went back to queued
+	Dead      uint64 // failures that ended dead
+	LeaseLost uint64 // Complete/Fail after the lease was reaped or cancelled
+	// LeaseFenced counts handlers cancelled because a heartbeat said the lease
+	// was gone (or it could not be renewed before it expired); a fenced job is
+	// never completed or failed by this process. Pool plus WorkerService.
+	LeaseFenced    uint64
 	SchedulerTicks uint64 // ticks run while holding the leader lock
 }
 
 // RegisterSnapshot exposes the runtime counters as observable counters sampled
 // at every export: jobrun_jobs_processed_total{result} (claimed, succeeded,
 // failed, retried, dead, lease_lost), jobrun_dead_total,
-// jobrun_lease_lost_total and jobrun_scheduler_ticks_total. With OTel disabled
+// jobrun_lease_lost_total, jobrun_lease_fenced_total and
+// jobrun_scheduler_ticks_total. With OTel disabled
 // the global no-op meter makes this free.
 func RegisterSnapshot(read func() Snapshot) error {
 	m := otel.Meter(MeterName)
@@ -50,6 +55,11 @@ func RegisterSnapshot(read func() Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("jobrun_lease_lost_total: %w", err)
 	}
+	fenced, err := m.Int64ObservableCounter("jobrun_lease_fenced_total",
+		metric.WithDescription("Handlers cancelled because their lease was lost (fenced by a heartbeat); never completed"))
+	if err != nil {
+		return fmt.Errorf("jobrun_lease_fenced_total: %w", err)
+	}
 	ticks, err := m.Int64ObservableCounter("jobrun_scheduler_ticks_total",
 		metric.WithDescription("Scheduler ticks run while holding the leader lock"))
 	if err != nil {
@@ -65,9 +75,10 @@ func RegisterSnapshot(read func() Snapshot) error {
 		o.ObserveInt64(processed, clamp(s.LeaseLost), metric.WithAttributes(resultLeaseLost))
 		o.ObserveInt64(dead, clamp(s.Dead))
 		o.ObserveInt64(leaseLost, clamp(s.LeaseLost))
+		o.ObserveInt64(fenced, clamp(s.LeaseFenced))
 		o.ObserveInt64(ticks, clamp(s.SchedulerTicks))
 		return nil
-	}, processed, dead, leaseLost, ticks)
+	}, processed, dead, leaseLost, fenced, ticks)
 	if err != nil {
 		return fmt.Errorf("register snapshot callback: %w", err)
 	}

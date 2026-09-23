@@ -31,19 +31,20 @@ type Store interface {
 	// Claim leases up to q.Limit ready jobs on q.Queue to q.Owner in one round
 	// trip (FOR UPDATE SKIP LOCKED) and increments attempts.
 	Claim(ctx context.Context, q ClaimQuery) ([]Job, error)
-	// Heartbeat extends the leases of ids owned by owner to until and returns
-	// the ids still held whose cancel is NOT requested. An id missing from kept
-	// means the lease was lost or cancelled: the worker cancels its context.
-	Heartbeat(ctx context.Context, owner string, ids []ID, until time.Time) (kept []ID, err error)
-	// Complete runs fn (may be nil) and the owner-guarded status update in one
-	// transaction; zero rows updated rolls fn back and returns ErrLeaseLost. A
-	// Complete after a cooperative cancel is recorded as an event but the status
-	// stays cancelled.
-	Complete(ctx context.Context, id ID, owner string, fn Commit) error
+	// Heartbeat extends the unexpired leases held by owner with a matching
+	// fencing token to until and says which were kept and which had a cancel
+	// requested; a lease in neither list was lost and the worker must fence it
+	// (cancel the handler, never Complete/Fail).
+	Heartbeat(ctx context.Context, owner string, leases []Lease, until time.Time) (Renewal, error)
+	// Complete runs fn (may be nil) and the owner- and token-guarded status
+	// update in one transaction; a lease no longer held rolls fn back and
+	// returns ErrLeaseLost. A Complete after a cooperative cancel is recorded as
+	// an event but the status stays cancelled.
+	Complete(ctx context.Context, l Lease, owner string, fn Commit) error
 	// Fail records cause and moves the job to queued at retryAt, or to dead when
 	// perm is set or attempts >= max_attempts; returns the resulting status.
-	// Owner-guarded like Complete (ErrLeaseLost).
-	Fail(ctx context.Context, id ID, owner, cause string, perm bool, retryAt time.Time) (Status, error)
+	// Owner- and token-guarded like Complete (ErrLeaseLost).
+	Fail(ctx context.Context, l Lease, owner, cause string, perm bool, retryAt time.Time) (Status, error)
 	// ReapExpired requeues up to limit leases expired at now with a backoff from
 	// the job's own policy (p is the fallback), or marks them dead at
 	// max_attempts, and returns the transitions it made.

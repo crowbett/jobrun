@@ -30,7 +30,8 @@ func toStatus(ctx context.Context, log *slog.Logger, method string, err error) e
 		return status.Error(codes.InvalidArgument, err.Error())
 	case errors.Is(err, job.ErrNotFound), errors.Is(err, job.ErrScheduleNotFound):
 		return status.Error(codes.NotFound, err.Error())
-	case errors.Is(err, job.ErrInvalidTransition), errors.Is(err, job.ErrNotCancellable), errors.Is(err, job.ErrNotRetryable):
+	case errors.Is(err, job.ErrInvalidTransition), errors.Is(err, job.ErrNotCancellable), errors.Is(err, job.ErrNotRetryable),
+		errors.Is(err, job.ErrLeaseLost):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, job.ErrScheduleExists), errors.Is(err, job.ErrIdempotencyConflict):
 		return status.Error(codes.AlreadyExists, err.Error())

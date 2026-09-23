@@ -8,9 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/crowbett/jobrun/internal/job"
+	"github.com/crowbett/jobrun/internal/obs"
 )
 
 // EventPublisher receives every transition the pool drives (queued -> leased,
@@ -75,6 +77,7 @@ func NewPool(s job.Store, d job.Dispatcher, reg *job.Registry, pub EventPublishe
 		claimBackoff: time.Second,
 	}
 	p.hb = newHeartbeater(s, c.Owner, c.HeartbeatEvery, c.LeaseTTL, storeTimeout, log, p.now)
+	p.hb.onFence = func() { p.st.fenced.Add(1) }
 	return p
 }
 
@@ -182,6 +185,7 @@ func (p *Pool) claimOnce(ctx, base context.Context, queue string) (full bool, er
 	}
 	free := cap(p.sem) - len(p.sem) // besides the slot we hold
 	limit := min(p.cfg.BatchSize, 1+free)
+	claimedAt := p.now() // before the round trip: the lease clock starts no earlier than this
 	jobs, err := p.store.Claim(ctx, job.ClaimQuery{
 		Queue:    queue,
 		Owner:    p.cfg.Owner,
@@ -197,13 +201,17 @@ func (p *Pool) claimOnce(ctx, base context.Context, queue string) (full bool, er
 			p.sem <- struct{}{}
 		}
 		p.wg.Add(1)
-		go p.runJob(base, jobs[i])
+		go p.runJob(base, jobs[i], claimedAt)
 	}
 	return len(jobs) == limit, nil
 }
 
 // runJob owns one slot and one wg count; it releases both when it returns.
-func (p *Pool) runJob(base context.Context, j job.Job) {
+//
+// A job whose lease the heartbeater fenced is never completed or failed: the
+// store would refuse it anyway (token guard), and not asking keeps a stale
+// worker from even trying to commit an effect. The reaper owns its fate.
+func (p *Pool) runJob(base context.Context, j job.Job, claimedAt time.Time) {
 	defer p.wg.Done()
 	defer func() { <-p.sem }()
 	p.st.claimed.Add(1)
@@ -215,21 +223,36 @@ func (p *Pool) runJob(base context.Context, j job.Job) {
 
 	jctx, cancel := context.WithTimeout(base, p.cfg.JobTimeout)
 	defer cancel()
-	p.hb.add(j.ID, cancel)
-	defer p.hb.remove(j.ID)
+	lease := job.LeaseOf(j)
+	p.hb.add(lease, cancel, claimedAt)
+	defer p.hb.remove(lease)
+
+	rctx, span := obs.StartRun(jctx, j)
+	var spanErr error
+	defer func() { obs.End(span, spanErr) }()
 
 	started := p.now()
-	commit, err := p.handle(jctx, j)
+	commit, err := p.handle(rctx, j)
 	elapsed := p.now().Sub(started)
 	if p.cfg.Durations != nil {
 		p.cfg.Durations.ObserveDuration(j.Queue, j.Type, elapsed)
 	}
 
-	sctx, scancel := context.WithTimeout(base, storeTimeout)
+	if p.hb.state(lease) == leaseFenced {
+		spanErr = fmt.Errorf("%w: fenced by heartbeat, not completed", job.ErrLeaseLost)
+		log.Warn("worker: lease fenced; result dropped, the reaper requeues the job", "took", elapsed, "handler_err", err)
+		return
+	}
+
+	sctx, scancel := context.WithTimeout(trace.ContextWithSpan(base, span), storeTimeout)
 	defer scancel()
 
 	if err == nil {
-		if cerr := p.store.Complete(sctx, j.ID, p.cfg.Owner, commit); cerr != nil {
+		cctx, cspan := obs.StartComplete(sctx, j)
+		cerr := p.store.Complete(cctx, lease, p.cfg.Owner, commit)
+		obs.End(cspan, cerr)
+		if cerr != nil {
+			spanErr = cerr
 			p.storeError(log, "complete", cerr)
 			return
 		}
@@ -239,13 +262,14 @@ func (p *Pool) runJob(base context.Context, j job.Job) {
 		return
 	}
 
+	spanErr = err
 	p.st.failed.Add(1)
 	perm := errors.Is(err, job.ErrPermanent)
-	cause := p.cause(jctx, j.ID, err)
+	cause := p.cause(jctx, lease, err)
 	// retryAt is app-clock based: Fail only stores it as run_at, and the claim
 	// query compares run_at against the database clock (docs/PLAN.md, Risks).
 	retryAt := p.now().Add(j.Backoff.Next(j.Attempts, nil))
-	status, ferr := p.store.Fail(sctx, j.ID, p.cfg.Owner, cause, perm, retryAt)
+	status, ferr := p.store.Fail(sctx, lease, p.cfg.Owner, cause, perm, retryAt)
 	if ferr != nil {
 		p.storeError(log, "fail", ferr)
 		return
@@ -287,11 +311,11 @@ func (p *Pool) handle(ctx context.Context, j job.Job) (commit job.Commit, err er
 
 // cause names why the attempt failed for last_error / the event, bounded and
 // cleaned by job.SanitizeError.
-func (p *Pool) cause(jctx context.Context, id job.ID, err error) string {
+func (p *Pool) cause(jctx context.Context, l job.Lease, err error) string {
 	var s string
 	switch {
-	case p.hb.dropped(id):
-		s = "lease lost or cancel requested: " + err.Error()
+	case p.hb.state(l) == leaseCancelRequested:
+		s = "cancel requested: " + err.Error()
 	case errors.Is(jctx.Err(), context.DeadlineExceeded):
 		s = fmt.Sprintf("job timeout after %s: %v", p.cfg.JobTimeout, err)
 	default:

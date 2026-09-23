@@ -131,6 +131,12 @@ func mustClaim(t *testing.T, s *postgres.Store, queue, owner string, limit int32
 	return jobs
 }
 
+// curLease is the lease a job holds right now (its current fencing token).
+func curLease(t *testing.T, s *postgres.Store, id job.ID) job.Lease {
+	t.Helper()
+	return job.LeaseOf(mustGet(t, s, id))
+}
+
 func dbNow(t *testing.T, s *postgres.Store) time.Time {
 	t.Helper()
 	now, err := s.Now(context.Background())
@@ -166,8 +172,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM goose_db_version WHERE version_id > 0").Scan(&n); err != nil {
 		t.Fatalf("goose_db_version: %v", err)
 	}
-	if n != 4 {
-		t.Fatalf("applied migrations: want 4 got %d", n)
+	if n != 5 {
+		t.Fatalf("applied migrations: want 5 got %d", n)
 	}
 }
 
@@ -426,13 +432,16 @@ func TestHeartbeatFencing(t *testing.T) {
 	}
 
 	until := dbNow(t, s).Add(time.Minute)
-	ids := []job.ID{expired.ID, cancelled.ID, healthy.ID, job.NewID()}
-	kept, err := s.Heartbeat(ctx, "w1", ids, until)
+	leases := []job.Lease{job.LeaseOf(expired), job.LeaseOf(cancelled), job.LeaseOf(healthy), {ID: job.NewID(), Token: 1}}
+	r, err := s.Heartbeat(ctx, "w1", leases, until)
 	if err != nil {
 		t.Fatalf("Heartbeat: %v", err)
 	}
-	if len(kept) != 1 || kept[0] != healthy.ID {
-		t.Fatalf("kept: want [%s] got %v", healthy.ID, kept)
+	if len(r.Kept) != 1 || r.Kept[0] != job.LeaseOf(healthy) {
+		t.Fatalf("kept: want [%s] got %v", healthy.ID, r.Kept)
+	}
+	if len(r.CancelRequested) != 1 || r.CancelRequested[0] != job.LeaseOf(cancelled) {
+		t.Fatalf("cancel requested: want [%s] got %v", cancelled.ID, r.CancelRequested)
 	}
 	if got := mustGet(t, s, healthy.ID); got.LeaseUntil == nil || !got.LeaseUntil.Equal(until.Truncate(time.Microsecond)) {
 		t.Fatalf("healthy lease_until not extended: %+v", got.LeaseUntil)
@@ -441,12 +450,94 @@ func TestHeartbeatFencing(t *testing.T) {
 	if got := mustGet(t, s, cancelled.ID); got.Status != job.StatusLeased || !got.CancelRequested {
 		t.Fatalf("cancelled job: %+v", got)
 	}
-	// Another owner keeps nothing; an empty id list is a no-op.
-	if kept, err := s.Heartbeat(ctx, "w2", []job.ID{healthy.ID}, until); err != nil || len(kept) != 0 {
-		t.Fatalf("other owner: %v / %v", kept, err)
+	// Another owner keeps nothing, a wrong token keeps nothing; an empty list is a no-op.
+	if r, err := s.Heartbeat(ctx, "w2", []job.Lease{job.LeaseOf(healthy)}, until); err != nil || len(r.Kept)+len(r.CancelRequested) != 0 {
+		t.Fatalf("other owner: %+v / %v", r, err)
 	}
-	if kept, err := s.Heartbeat(ctx, "w1", nil, until); err != nil || len(kept) != 0 {
-		t.Fatalf("empty ids: %v / %v", kept, err)
+	stale := job.Lease{ID: healthy.ID, Token: healthy.LeaseToken - 1}
+	if r, err := s.Heartbeat(ctx, "w1", []job.Lease{stale}, until); err != nil || len(r.Kept)+len(r.CancelRequested) != 0 {
+		t.Fatalf("stale token: %+v / %v", r, err)
+	}
+	if r, err := s.Heartbeat(ctx, "w1", nil, until); err != nil || len(r.Kept) != 0 {
+		t.Fatalf("empty leases: %+v / %v", r, err)
+	}
+}
+
+// TestLeaseTokenFencesReclaim is the case owner-only fencing missed: the same
+// owner reclaims a reaped job, and the first attempt's lease must stay dead.
+func TestLeaseTokenFencesReclaim(t *testing.T) {
+	t.Parallel()
+	s, pool := newStore(t)
+	ctx := context.Background()
+	j := mustEnqueue(t, s, newJob(t, "fence"))
+	first := mustClaim(t, s, "fence", "w1", 1, time.Minute)
+	if len(first) != 1 || first[0].LeaseToken != 1 {
+		t.Fatalf("first claim: %+v", first)
+	}
+	expireLease(t, pool, j.ID)
+	if evs, err := s.ReapExpired(ctx, dbNow(t, s), 10, job.Policy{Base: time.Microsecond, Max: time.Microsecond, Factor: 1}); err != nil || len(evs) != 1 {
+		t.Fatalf("reap: %+v / %v", evs, err)
+	}
+	var second []job.Job
+	deadline := time.Now().Add(5 * time.Second)
+	for len(second) == 0 && time.Now().Before(deadline) {
+		second = mustClaim(t, s, "fence", "w1", 1, time.Minute)
+	}
+	if len(second) != 1 || second[0].LeaseToken != 2 || second[0].Attempts != 2 {
+		t.Fatalf("second claim: %+v", second)
+	}
+	old, cur := job.LeaseOf(first[0]), job.LeaseOf(second[0])
+	until := dbNow(t, s).Add(time.Minute)
+	if r, err := s.Heartbeat(ctx, "w1", []job.Lease{old}, until); err != nil || len(r.Kept) != 0 {
+		t.Fatalf("old lease heartbeat: %+v / %v", r, err)
+	}
+	if err := s.Complete(ctx, old, "w1", nil); !errors.Is(err, job.ErrLeaseLost) {
+		t.Fatalf("old lease Complete: want ErrLeaseLost got %v", err)
+	}
+	if _, err := s.Fail(ctx, old, "w1", "late", false, until); !errors.Is(err, job.ErrLeaseLost) {
+		t.Fatalf("old lease Fail: want ErrLeaseLost got %v", err)
+	}
+	if r, err := s.Heartbeat(ctx, "w1", []job.Lease{old, cur}, until); err != nil || len(r.Kept) != 1 || r.Kept[0] != cur {
+		t.Fatalf("current lease heartbeat: %+v / %v", r, err)
+	}
+	if err := s.Complete(ctx, cur, "w1", nil); err != nil {
+		t.Fatalf("current lease Complete: %v", err)
+	}
+}
+
+// TestTraceParentRoundTrip: the enqueue trace context is stored and read back
+// on Get and Claim, for single and batch enqueue.
+func TestTraceParentRoundTrip(t *testing.T) {
+	t.Parallel()
+	s, _ := newStore(t)
+	ctx := context.Background()
+	const tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	one := newJob(t, "tp")
+	one.TraceParent = tp
+	mustEnqueue(t, s, one)
+	batch := newJob(t, "tp")
+	batch.TraceParent = tp
+	plain := newJob(t, "tp")
+	if _, err := s.EnqueueBatch(ctx, []job.Job{batch, plain}); err != nil {
+		t.Fatalf("EnqueueBatch: %v", err)
+	}
+	for _, tc := range []struct {
+		id   job.ID
+		want string
+	}{{one.ID, tp}, {batch.ID, tp}, {plain.ID, ""}} {
+		if got := mustGet(t, s, tc.id).TraceParent; got != tc.want {
+			t.Fatalf("Get(%s).TraceParent = %q want %q", tc.id, got, tc.want)
+		}
+	}
+	claimed := mustClaim(t, s, "tp", "w1", 3, time.Minute)
+	n := 0
+	for _, c := range claimed {
+		if c.TraceParent == tp {
+			n++
+		}
+	}
+	if len(claimed) != 3 || n != 2 {
+		t.Fatalf("claimed %d, %d with traceparent", len(claimed), n)
 	}
 }
 
@@ -471,7 +562,7 @@ func TestCompleteRunsEffectOnceInTx(t *testing.T) {
 	}
 
 	// Wrong owner: nothing changes, the effect rolls back.
-	if err := s.Complete(ctx, j.ID, "w2", effect); !errors.Is(err, job.ErrLeaseLost) {
+	if err := s.Complete(ctx, curLease(t, s, j.ID), "w2", effect); !errors.Is(err, job.ErrLeaseLost) {
 		t.Fatalf("wrong owner: want ErrLeaseLost got %v", err)
 	}
 	var n int
@@ -482,7 +573,7 @@ func TestCompleteRunsEffectOnceInTx(t *testing.T) {
 		t.Fatalf("EffectDone before: %v / %v", done, err)
 	}
 
-	if err := s.Complete(ctx, j.ID, "w1", effect); err != nil {
+	if err := s.Complete(ctx, curLease(t, s, j.ID), "w1", effect); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	got := mustGet(t, s, j.ID)
@@ -500,10 +591,10 @@ func TestCompleteRunsEffectOnceInTx(t *testing.T) {
 		t.Fatalf("events: %v", eventStatuses(evs))
 	}
 	// A second Complete finds no lease.
-	if err := s.Complete(ctx, j.ID, "w1", nil); !errors.Is(err, job.ErrLeaseLost) {
+	if err := s.Complete(ctx, curLease(t, s, j.ID), "w1", nil); !errors.Is(err, job.ErrLeaseLost) {
 		t.Fatalf("second Complete: want ErrLeaseLost got %v", err)
 	}
-	if err := s.Complete(ctx, job.NewID(), "w1", nil); !errors.Is(err, job.ErrNotFound) {
+	if err := s.Complete(ctx, job.Lease{ID: job.NewID(), Token: 1}, "w1", nil); !errors.Is(err, job.ErrNotFound) {
 		t.Fatalf("Complete(unknown): want ErrNotFound got %v", err)
 	}
 
@@ -511,7 +602,7 @@ func TestCompleteRunsEffectOnceInTx(t *testing.T) {
 	j2 := mustEnqueue(t, s, newJob(t, "c"))
 	mustClaim(t, s, "c", "w1", 1, time.Minute)
 	boom := errors.New("boom")
-	if err := s.Complete(ctx, j2.ID, "w1", func(context.Context, job.Execer) error { return boom }); !errors.Is(err, boom) {
+	if err := s.Complete(ctx, curLease(t, s, j2.ID), "w1", func(context.Context, job.Execer) error { return boom }); !errors.Is(err, boom) {
 		t.Fatalf("failing effect: want boom got %v", err)
 	}
 	if got := mustGet(t, s, j2.ID); got.Status != job.StatusLeased {
@@ -538,7 +629,7 @@ func TestCompleteAfterReapIsLeaseLost(t *testing.T) {
 		t.Fatalf("ReapExpired: %+v / %v", evs, err)
 	}
 	effectRan := false
-	err = s.Complete(ctx, j.ID, "w1", func(ctx context.Context, ex job.Execer) error {
+	err = s.Complete(ctx, curLease(t, s, j.ID), "w1", func(ctx context.Context, ex job.Execer) error {
 		effectRan = true
 		_, err := ex.Exec(ctx, "INSERT INTO effects_out (job_id) VALUES ($1)", j.ID)
 		return err
@@ -561,7 +652,7 @@ func TestCompleteAfterReapIsLeaseLost(t *testing.T) {
 		t.Fatalf("reaped job: %+v", got)
 	}
 	// Fail from the stale owner is equally refused.
-	if _, err := s.Fail(ctx, j.ID, "w1", "late", false, dbNow(t, s)); !errors.Is(err, job.ErrLeaseLost) {
+	if _, err := s.Fail(ctx, curLease(t, s, j.ID), "w1", "late", false, dbNow(t, s)); !errors.Is(err, job.ErrLeaseLost) {
 		t.Fatalf("Fail after reap: want ErrLeaseLost got %v", err)
 	}
 }
@@ -574,7 +665,7 @@ func TestFailRetriesThenDead(t *testing.T) {
 
 	mustClaim(t, s, "f", "w1", 1, time.Minute)
 	retryAt := dbNow(t, s).Add(time.Hour).Truncate(time.Microsecond)
-	st, err := s.Fail(ctx, j.ID, "w1", "first failure", false, retryAt)
+	st, err := s.Fail(ctx, curLease(t, s, j.ID), "w1", "first failure", false, retryAt)
 	if err != nil || st != job.StatusQueued {
 		t.Fatalf("Fail #1: %v / %v", st, err)
 	}
@@ -592,7 +683,7 @@ func TestFailRetriesThenDead(t *testing.T) {
 	if c := mustClaim(t, s, "f", "w1", 1, time.Minute); len(c) != 1 || c[0].Attempts != 2 {
 		t.Fatalf("claim #2: %+v", c)
 	}
-	st, err = s.Fail(ctx, j.ID, "w1", "second failure", false, dbNow(t, s))
+	st, err = s.Fail(ctx, curLease(t, s, j.ID), "w1", "second failure", false, dbNow(t, s))
 	if err != nil || st != job.StatusDead {
 		t.Fatalf("Fail #2: %v / %v", st, err)
 	}
@@ -609,10 +700,10 @@ func TestFailRetriesThenDead(t *testing.T) {
 	// Permanent failure goes straight to dead on the first attempt.
 	p := mustEnqueue(t, s, newJob(t, "f"))
 	mustClaim(t, s, "f", "w1", 1, time.Minute)
-	if st, err := s.Fail(ctx, p.ID, "w1", "bad payload", true, dbNow(t, s)); err != nil || st != job.StatusDead {
+	if st, err := s.Fail(ctx, curLease(t, s, p.ID), "w1", "bad payload", true, dbNow(t, s)); err != nil || st != job.StatusDead {
 		t.Fatalf("permanent: %v / %v", st, err)
 	}
-	if _, err := s.Fail(ctx, p.ID, "w1", "again", false, dbNow(t, s)); !errors.Is(err, job.ErrLeaseLost) {
+	if _, err := s.Fail(ctx, curLease(t, s, p.ID), "w1", "again", false, dbNow(t, s)); !errors.Is(err, job.ErrLeaseLost) {
 		t.Fatalf("Fail on a dead job: want ErrLeaseLost got %v", err)
 	}
 }
@@ -634,7 +725,7 @@ func TestFailStoresHostileCause(t *testing.T) {
 	for _, tc := range causes {
 		j := mustEnqueue(t, s, newJob(t, "hostile", func(n *job.NewJob) { n.MaxAttempts = 1 }))
 		mustClaim(t, s, "hostile", "w1", 1, time.Minute)
-		st, err := s.Fail(ctx, j.ID, "w1", tc.cause, false, dbNow(t, s))
+		st, err := s.Fail(ctx, curLease(t, s, j.ID), "w1", tc.cause, false, dbNow(t, s))
 		if err != nil || st != job.StatusDead {
 			t.Fatalf("%s: Fail: %v / %v", tc.name, st, err)
 		}
@@ -814,7 +905,7 @@ func TestCancel(t *testing.T) {
 	if got, err := s.Cancel(ctx, l.ID); err != nil || !got.CancelRequested { // idempotent
 		t.Fatalf("second cancel leased: %+v / %v", got, err)
 	}
-	if err := s.Complete(ctx, l.ID, "w1", nil); err != nil {
+	if err := s.Complete(ctx, curLease(t, s, l.ID), "w1", nil); err != nil {
 		t.Fatalf("Complete after cancel: %v", err)
 	}
 	if got := mustGet(t, s, l.ID); got.Status != job.StatusCancelled || got.FinishedAt == nil || got.LeaseOwner != "" {
@@ -830,7 +921,7 @@ func TestCancel(t *testing.T) {
 	if _, err := s.Cancel(ctx, f.ID); err != nil {
 		t.Fatal(err)
 	}
-	st, err := s.Fail(ctx, f.ID, "w1", "context canceled", false, dbNow(t, s).Add(time.Second))
+	st, err := s.Fail(ctx, curLease(t, s, f.ID), "w1", "context canceled", false, dbNow(t, s).Add(time.Second))
 	if err != nil || st != job.StatusCancelled {
 		t.Fatalf("Fail after cancel: %v / %v", st, err)
 	}
@@ -852,7 +943,7 @@ func TestRetry(t *testing.T) {
 	if _, err := s.Retry(ctx, j.ID); !errors.Is(err, job.ErrNotRetryable) {
 		t.Fatalf("retry leased: want ErrNotRetryable got %v", err)
 	}
-	if st, err := s.Fail(ctx, j.ID, "w1", "nope", false, dbNow(t, s)); err != nil || st != job.StatusDead {
+	if st, err := s.Fail(ctx, curLease(t, s, j.ID), "w1", "nope", false, dbNow(t, s)); err != nil || st != job.StatusDead {
 		t.Fatalf("Fail: %v / %v", st, err)
 	}
 	before := dbNow(t, s)
@@ -876,7 +967,7 @@ func TestRetry(t *testing.T) {
 	if _, err := s.Cancel(ctx, c.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Complete(ctx, c.ID, "w1", nil); err != nil {
+	if err := s.Complete(ctx, curLease(t, s, c.ID), "w1", nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := s.Retry(ctx, c.ID); err != nil || got.Status != job.StatusQueued || got.CancelRequested {
@@ -899,11 +990,11 @@ func TestPurge(t *testing.T) {
 	elsewhere := mustEnqueue(t, s, newJob(t, "keep"))
 	mustClaim(t, s, "purge", "w1", 3, time.Minute)
 	for _, id := range []job.ID{done1.ID, done2.ID} {
-		if err := s.Complete(ctx, id, "w1", nil); err != nil {
+		if err := s.Complete(ctx, curLease(t, s, id), "w1", nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := s.Fail(ctx, dead.ID, "w1", "x", true, dbNow(t, s)); err != nil {
+	if _, err := s.Fail(ctx, curLease(t, s, dead.ID), "w1", "x", true, dbNow(t, s)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Cancel(ctx, elsewhere.ID); err != nil {
@@ -990,7 +1081,7 @@ func TestEventModeTerminal(t *testing.T) {
 	if evs, _ := s.Events(ctx, j.ID); len(evs) != 0 {
 		t.Fatalf("terminal mode must skip enqueue/claim events: %v", eventStatuses(evs))
 	}
-	if err := s.Complete(ctx, j.ID, "w1", nil); err != nil {
+	if err := s.Complete(ctx, curLease(t, s, j.ID), "w1", nil); err != nil {
 		t.Fatal(err)
 	}
 	if evs, _ := s.Events(ctx, j.ID); fmt.Sprint(eventStatuses(evs)) != "[leased->succeeded]" {

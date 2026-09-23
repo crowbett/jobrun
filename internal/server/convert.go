@@ -136,6 +136,7 @@ func jobToProto(j job.Job) *jobrunv1.Job {
 		StartedAt:       tsPtr(j.StartedAt),
 		FinishedAt:      tsPtr(j.FinishedAt),
 		CancelRequested: j.CancelRequested,
+		Traceparent:     j.TraceParent,
 	}
 }
 
