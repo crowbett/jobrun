@@ -442,16 +442,19 @@ func (s *WorkerServer) touch(ls []job.Lease) {
 	}
 }
 
-// untrack forgets l and returns what was known about its job (ID only when unknown).
-func (s *WorkerServer) untrack(l job.Lease) job.Job {
+// untrack forgets l and returns what was known about its job (ID only when
+// unknown) and whether this server was still tracking it. Complete and Fail
+// untrack before they touch the store, so a heartbeat racing a completion
+// never counts the finished lease as fenced.
+func (s *WorkerServer) untrack(l job.Lease) (job.Job, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.inflight[l]
 	if !ok {
-		return job.Job{ID: l.ID}
+		return job.Job{ID: l.ID}, false
 	}
 	delete(s.inflight, l)
-	return job.Job{ID: l.ID, Queue: e.queue, Type: e.typ, Attempts: e.attempt}
+	return job.Job{ID: l.ID, Queue: e.queue, Type: e.typ, Attempts: e.attempt}, true
 }
 
 func leasesToProto(ls []job.Lease) []*jobrunv1.Lease {
@@ -511,10 +514,13 @@ func (s *WorkerServer) Heartbeat(ctx context.Context, req *jobrunv1.HeartbeatReq
 		seen[l] = struct{}{}
 	}
 	var lost []job.Lease
+	fenced := 0
 	for _, l := range leases {
 		if _, ok := seen[l]; !ok {
 			lost = append(lost, l)
-			s.untrack(l)
+			if _, tracked := s.untrack(l); tracked {
+				fenced++ // delivered by this server and not finished: a real fence
+			}
 		}
 	}
 	resp := &jobrunv1.HeartbeatResponse{
@@ -523,8 +529,8 @@ func (s *WorkerServer) Heartbeat(ctx context.Context, req *jobrunv1.HeartbeatReq
 		Lost:            leasesToProto(lost),
 		LeaseTtl:        durationpb.New(s.cfg.LeaseTTL),
 	}
-	if n := len(resp.GetLost()); n > 0 {
-		s.fenced.Add(int64(n))
+	s.fenced.Add(int64(fenced))
+	if len(lost) > 0 {
 		s.log.WarnContext(ctx, "remote worker lost leases", "owner", owner, "lost", len(lost))
 	}
 	return resp, nil
@@ -544,6 +550,7 @@ func (s *WorkerServer) Complete(ctx context.Context, req *jobrunv1.CompleteReque
 	ctx = obs.WithTraceParent(ctx, req.GetTraceparent())
 	ctx, span := obs.StartComplete(ctx, job.Job{ID: l.ID})
 	defer func() { obs.End(span, err) }()
+	j, _ := s.untrack(l)
 	if err := s.leases.Complete(ctx, l, owner, nil); err != nil {
 		if errors.Is(err, job.ErrLeaseLost) {
 			s.leaseLost.Add(1)
@@ -551,7 +558,7 @@ func (s *WorkerServer) Complete(ctx context.Context, req *jobrunv1.CompleteReque
 		return nil, toStatus(ctx, s.log, "Complete", err)
 	}
 	s.completed.Add(1)
-	s.publish(s.untrack(l), job.StatusLeased, job.StatusSucceeded, "")
+	s.publish(j, job.StatusLeased, job.StatusSucceeded, "")
 	return &jobrunv1.CompleteResponse{Status: jobrunv1.JobStatus_JOB_STATUS_SUCCEEDED}, nil
 }
 
@@ -581,6 +588,7 @@ func (s *WorkerServer) Fail(ctx context.Context, req *jobrunv1.FailRequest) (res
 		cause = "remote worker reported failure"
 	}
 	retryAt := s.now().Add(cur.Backoff.Next(cur.Attempts, nil))
+	s.untrack(l)
 	st, err := s.leases.Fail(ctx, l, owner, cause, req.GetPermanent(), retryAt)
 	if err != nil {
 		if errors.Is(err, job.ErrLeaseLost) {
@@ -589,7 +597,6 @@ func (s *WorkerServer) Fail(ctx context.Context, req *jobrunv1.FailRequest) (res
 		return nil, toStatus(ctx, s.log, "Fail", err)
 	}
 	s.failed.Add(1)
-	s.untrack(l)
 	s.publish(cur, job.StatusLeased, st, cause)
 	return &jobrunv1.FailResponse{Status: statusToProto(st)}, nil
 }

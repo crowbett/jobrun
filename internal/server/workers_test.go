@@ -197,7 +197,9 @@ func TestWorkerServiceFencing(t *testing.T) {
 		hb.GetLeaseTtl().AsDuration() != time.Second {
 		t.Fatalf("heartbeat = %v", hb)
 	}
-	if ws.Stats().Fenced != 1 {
+	// Fenced counts only leases this server delivered (these were claimed on the
+	// store directly); the stream path is covered in cmd/jobworker's integration test.
+	if ws.Stats().Fenced != 0 {
 		t.Fatalf("stats = %+v", ws.Stats())
 	}
 	// Another worker id is a different owner: nothing is kept.

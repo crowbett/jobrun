@@ -238,11 +238,16 @@ func (p *Pool) runJob(base context.Context, j job.Job, claimedAt time.Time) {
 		p.cfg.Durations.ObserveDuration(j.Queue, j.Type, elapsed)
 	}
 
-	if p.hb.state(lease) == leaseFenced {
+	state := p.hb.state(lease)
+	if state == leaseFenced {
 		spanErr = fmt.Errorf("%w: fenced by heartbeat, not completed", job.ErrLeaseLost)
 		log.Warn("worker: lease fenced; result dropped, the reaper requeues the job", "took", elapsed, "handler_err", err)
 		return
 	}
+	// Stop heartbeating before reporting: the store guards Complete/Fail by
+	// token anyway, and a heartbeat racing the commit must not count the
+	// finished lease as fenced.
+	p.hb.remove(lease)
 
 	sctx, scancel := context.WithTimeout(trace.ContextWithSpan(base, span), storeTimeout)
 	defer scancel()
@@ -265,7 +270,7 @@ func (p *Pool) runJob(base context.Context, j job.Job, claimedAt time.Time) {
 	spanErr = err
 	p.st.failed.Add(1)
 	perm := errors.Is(err, job.ErrPermanent)
-	cause := p.cause(jctx, lease, err)
+	cause := p.cause(jctx, state, err)
 	// retryAt is app-clock based: Fail only stores it as run_at, and the claim
 	// query compares run_at against the database clock (docs/PLAN.md, Risks).
 	retryAt := p.now().Add(j.Backoff.Next(j.Attempts, nil))
@@ -311,10 +316,10 @@ func (p *Pool) handle(ctx context.Context, j job.Job) (commit job.Commit, err er
 
 // cause names why the attempt failed for last_error / the event, bounded and
 // cleaned by job.SanitizeError.
-func (p *Pool) cause(jctx context.Context, l job.Lease, err error) string {
+func (p *Pool) cause(jctx context.Context, state leaseState, err error) string {
 	var s string
 	switch {
-	case p.hb.state(l) == leaseCancelRequested:
+	case state == leaseCancelRequested:
 		s = "cancel requested: " + err.Error()
 	case errors.Is(jctx.Err(), context.DeadlineExceeded):
 		s = fmt.Sprintf("job timeout after %s: %v", p.cfg.JobTimeout, err)

@@ -449,11 +449,16 @@ func (w *Worker) run(base context.Context, j Job, receivedAt time.Time) {
 	}()
 
 	err := w.handle(rctx, j)
-	if w.state(key) == stateFenced {
+	state := w.state(key)
+	if state == stateFenced {
 		spanErr = errors.New("lease lost: fenced by heartbeat, not completed")
 		log.Warn("jobworker: lease fenced; result dropped, the job will run again", "handler_err", err)
 		return
 	}
+	// Stop heartbeating before reporting: the server guards Complete/Fail by
+	// token anyway, and a heartbeat racing the report must not count the
+	// finished lease as fenced.
+	w.untrack(key)
 	tp := traceParentOf(rctx)
 	pl := &jobrunv1.Lease{JobId: j.ID, Token: j.LeaseToken}
 	if err == nil {
@@ -471,7 +476,7 @@ func (w *Worker) run(base context.Context, j Job, receivedAt time.Time) {
 	}
 	spanErr = err
 	cause := err.Error()
-	if w.state(key) == stateCancelRequested {
+	if state == stateCancelRequested {
 		cause = "cancel requested: " + cause
 	} else if errors.Is(jctx.Err(), context.DeadlineExceeded) {
 		cause = fmt.Sprintf("job timeout after %s: %v", w.cfg.JobTimeout, err)
