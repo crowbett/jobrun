@@ -305,21 +305,33 @@ func (s *WorkerServer) Claim(stream grpc.BidiStreamingServer[jobrunv1.ClaimReque
 			}
 		}
 	}()
+	work := make(chan struct{}, 1) // coalesced "a queue may have work"
 	for _, q := range queues {
 		ch := s.disp.Wait(ctx, q)
 		go func() {
 			for range ch {
-				cr.signal()
+				select {
+				case work <- struct{}{}:
+				default:
+				}
 			}
 		}()
 	}
 	floor := time.NewTicker(s.cfg.PollFloor)
 	defer floor.Stop()
 
+	// A returned credit only triggers a claim when the last fill stopped for
+	// lack of credits; when it stopped for lack of work, only the dispatcher or
+	// the poll floor does. Otherwise every finished job would cost an empty
+	// claim transaction.
 	next := 0 // round-robin start so one busy queue cannot starve the others
+	needFill, creditBound := true, false
 	for {
-		if err := s.fill(ctx, stream, owner, queues, &next, cr); err != nil {
-			return err
+		if needFill {
+			var err error
+			if creditBound, err = s.fill(ctx, stream, owner, queues, &next, cr); err != nil {
+				return err
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -335,21 +347,27 @@ func (s *WorkerServer) Claim(stream grpc.BidiStreamingServer[jobrunv1.ClaimReque
 			}
 			return nil // transport gone; ctx follows
 		case <-cr.wake:
+			needFill = creditBound
+		case <-work:
+			needFill = true
 		case <-floor.C:
+			needFill = true
 		}
 	}
 }
 
 // fill claims and sends while the stream has credits and some queue has work.
+// creditBound reports that it stopped because the credits ran out (so a new
+// credit should trigger another fill) rather than because the queues were empty.
 func (s *WorkerServer) fill(ctx context.Context, stream grpc.BidiStreamingServer[jobrunv1.ClaimRequest, jobrunv1.ClaimResponse],
 	owner string, queues []string, next *int, cr *credits,
-) error {
+) (creditBound bool, err error) {
 	for {
 		got := false
 		for i := range queues {
 			want := min(cr.available(), s.cfg.BatchSize)
 			if want <= 0 {
-				return nil
+				return true, nil
 			}
 			q := queues[(*next+i)%len(queues)]
 			jobs, err := s.leases.Claim(ctx, job.ClaimQuery{
@@ -357,14 +375,14 @@ func (s *WorkerServer) fill(ctx context.Context, stream grpc.BidiStreamingServer
 			})
 			if err != nil {
 				if ctx.Err() != nil {
-					return ctx.Err() // the stream is gone; nobody reads this status
+					return false, ctx.Err() // the stream is gone; nobody reads this status
 				}
-				return toStatus(ctx, s.log, "Claim", err)
+				return false, toStatus(ctx, s.log, "Claim", err)
 			}
 			for k := range jobs {
 				if err := s.send(stream, jobs[k]); err != nil {
 					s.release(owner, jobs[k:], err)
-					return nil // the stream is gone; its ctx ends the loop
+					return false, nil // the stream is gone; its ctx ends the loop
 				}
 				cr.spend()
 			}
@@ -372,7 +390,7 @@ func (s *WorkerServer) fill(ctx context.Context, stream grpc.BidiStreamingServer
 		}
 		*next = (*next + 1) % len(queues)
 		if !got {
-			return nil
+			return false, nil
 		}
 	}
 }
