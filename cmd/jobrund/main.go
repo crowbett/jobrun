@@ -156,15 +156,25 @@ func run() error {
 		Policy:    job.DefaultPolicy,
 	})
 
+	// Out-of-process workers lease through the same store, fenced by the same
+	// tokens, woken by the same notifier; their transitions reach the broker.
+	remote := server.NewWorkerServer(store, logger, server.WorkerConfig{
+		LeaseTTL:  cfg.Worker.LeaseTTL,
+		PollFloor: cfg.Worker.PollFloor,
+		BatchSize: cfg.Worker.BatchSize,
+	}, server.WithDispatcher(notifier), server.WithPublisher(broker))
+
 	snap := func() obs.Snapshot {
 		ws := wp.Stats()
+		rs := remote.Stats()
 		s := obs.Snapshot{
-			Claimed:   uint64(ws.Claimed),   //nolint:gosec // counters are non-negative
-			Succeeded: uint64(ws.Succeeded), //nolint:gosec // counters are non-negative
-			Failed:    uint64(ws.Failed),    //nolint:gosec // counters are non-negative
-			Retried:   uint64(ws.Retried),   //nolint:gosec // counters are non-negative
-			Dead:      uint64(ws.Dead),      //nolint:gosec // counters are non-negative
-			LeaseLost: uint64(ws.LeaseLost), //nolint:gosec // counters are non-negative
+			Claimed:     uint64(ws.Claimed),                  //nolint:gosec // counters are non-negative
+			Succeeded:   uint64(ws.Succeeded),                //nolint:gosec // counters are non-negative
+			Failed:      uint64(ws.Failed),                   //nolint:gosec // counters are non-negative
+			Retried:     uint64(ws.Retried),                  //nolint:gosec // counters are non-negative
+			Dead:        uint64(ws.Dead),                     //nolint:gosec // counters are non-negative
+			LeaseLost:   uint64(ws.LeaseLost + rs.LeaseLost), //nolint:gosec // counters are non-negative
+			LeaseFenced: uint64(ws.Fenced + rs.Fenced),       //nolint:gosec // counters are non-negative
 		}
 		if sched != nil {
 			s.SchedulerTicks = uint64(sched.Ticks()) //nolint:gosec // counter is non-negative
@@ -180,7 +190,9 @@ func run() error {
 	counters := func() admin.Counters {
 		c := broker.Counters()
 		c.LeaseExpired = uint64(rp.Stats().Reaped) //nolint:gosec // counter is non-negative
-		c.SchedulerTicks = snap().SchedulerTicks
+		s := snap()
+		c.SchedulerTicks = s.SchedulerTicks
+		c.LeaseFenced = s.LeaseFenced
 		return c
 	}
 
@@ -214,10 +226,12 @@ func run() error {
 	)
 	server.NewJobServer(store, logger, server.WithDepthCache(depth)).Register(grpcSrv)
 	server.NewScheduleServer(store, logger).Register(grpcSrv)
+	remote.Register(grpcSrv)
 	healthSrv := health.NewServer()
 	healthv1.RegisterHealthServer(grpcSrv, healthSrv)
 	healthSrv.SetServingStatus(jobrunv1.JobService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
 	healthSrv.SetServingStatus(jobrunv1.ScheduleService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
+	healthSrv.SetServingStatus(jobrunv1.WorkerService_ServiceDesc.ServiceName, healthv1.HealthCheckResponse_SERVING)
 	reflection.Register(grpcSrv)
 
 	// --- Admin http ---------------------------------------------------------------
@@ -229,7 +243,7 @@ func run() error {
 		Build:          map[string]string{"version": version, "go_version": runtime.Version(), "env": cfg.Env},
 		Version:        version,
 		StartedAt:      startedAt,
-		Pool:           func() any { return wp.Stats() },
+		Pool:           func() any { return poolStats{Stats: wp.Stats(), Remote: remote.Stats()} },
 		AllowedOrigins: cfg.AdminCORSOrigins,
 		Log:            logger,
 	})
@@ -246,7 +260,7 @@ func run() error {
 	defer stopInfra()
 
 	bg := background{
-		pool: wp, sched: sched, reap: rp,
+		pool: wp, sched: sched, reap: rp, remote: remote,
 		stopPool: stopPool, stopBG: stopBG, stopInfra: stopInfra,
 	}
 	bg.notifierDone = spawn(infraCtx, logger, "notifier", notifier.Run)
@@ -284,12 +298,20 @@ func run() error {
 	return runErr
 }
 
+// poolStats is the /admin/stats "pool" object: the in-process pool's counters
+// plus the WorkerService's (remote workers) under "Remote".
+type poolStats struct {
+	worker.Stats
+	Remote server.WorkerStats
+}
+
 // background holds the long-running goroutines and their stop handles, grouped
 // by teardown stage.
 type background struct {
-	pool  *worker.Pool
-	sched *scheduler.Scheduler
-	reap  *reaper.Reaper
+	pool   *worker.Pool
+	sched  *scheduler.Scheduler
+	reap   *reaper.Reaper
+	remote *server.WorkerServer
 
 	stopPool, stopBG, stopInfra context.CancelFunc
 
@@ -307,8 +329,10 @@ type background struct {
 func teardown(cfg config.Config, logger *slog.Logger, grpcSrv *grpc.Server, healthSrv *health.Server,
 	adminSrv *http.Server, bg background,
 ) {
-	// Stage 1.
+	// Stage 1. Claim streams are long-lived: end them first or GracefulStop
+	// waits the whole budget for them.
 	healthSrv.Shutdown()
+	bg.remote.Drain()
 	grpcDone := make(chan struct{})
 	go func() { grpcSrv.GracefulStop(); close(grpcDone) }()
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.StopTimeout)
@@ -321,7 +345,7 @@ func teardown(cfg config.Config, logger *slog.Logger, grpcSrv *grpc.Server, heal
 	if adminErr != nil {
 		logger.Warn("teardown 1/6: admin drain incomplete", slog.Any("err", adminErr))
 	}
-	logger.Info("teardown 1/6: grpc + admin drained")
+	logger.Info("teardown 1/6: grpc + admin drained", "remote", fmt.Sprintf("%+v", bg.remote.Stats()))
 
 	// Stage 2: Pool.Run returns once in-flight handlers have finished (or its
 	// own drain budget ran out); we wait poolDrainTimeout at most.

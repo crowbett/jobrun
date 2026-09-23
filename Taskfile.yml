@@ -39,11 +39,12 @@ tasks:
       - go mod verify
 
   build:
-    desc: Build jobrund and the jobrun CLI into bin/
+    desc: Build jobrund, the jobrun CLI and the jobworker remote worker into bin/
     deps: [gen]
     cmds:
       - go build -trimpath -ldflags="{{.LDFLAGS}}" -o {{.BIN}} {{.MAIN}}
       - go build -trimpath -ldflags="{{.LDFLAGS}}" -o bin/jobrun{{exeExt}} ./cmd/jobrun
+      - go build -trimpath -ldflags="{{.LDFLAGS}}" -o bin/jobworker{{exeExt}} ./cmd/jobworker
     sources:
       - "**/*.go"
       - go.mod
@@ -51,6 +52,7 @@ tasks:
     generates:
       - "{{.BIN}}"
       - bin/jobrun{{exeExt}}
+      - bin/jobworker{{exeExt}}
 
   run:
     desc: "Run jobrund locally (gRPC :50052, admin 127.0.0.1:9110; stack must be up: task db:up). Migrates on start."
@@ -61,6 +63,11 @@ tasks:
       LOG_FORMAT: text
       DATABASE_URL: "{{.DATABASE_URL}}"
       WORKER_QUEUES: '{{.WORKER_QUEUES | default "default,bench"}}'
+
+  worker:
+    desc: "Run an out-of-process worker against a running jobrund (task worker -- -queues bench -concurrency 16)"
+    cmds:
+      - go run ./cmd/jobworker -addr {{.GRPC_ADDR}} -log-format text {{.CLI_ARGS}}
 
   admin:
     desc: Open the admin page (http://127.0.0.1:9110/admin) of a running jobrund
