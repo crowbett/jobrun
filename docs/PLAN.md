@@ -339,3 +339,57 @@ P16 pass over this repo: security review, fuzzing, coverage, CI. Commits `bfc31a
 **goreleaser.** Not applicable: jobrun is a daemon plus a client CLI shipped as a container image; it is not on the P16 CLI list.
 
 **Resolved (2026-09-22).** `/admin/stats` and `/admin/events` used to send `Access-Control-Allow-Origin: *` so a `file://` page could subscribe; on a loopback bind that let any site open in the operator's browser read queue names, types and job error strings. They now send no ACAO by default (the embedded page is same-origin and needs none); `ADMIN_CORS_ORIGINS` is an opt-in allowlist of exact origins that are echoed back, enforced by one wrapper (`internal/admin/cors.go`). `*` and `null` are refused by `config.Validate`, so the `file://` use case is gone by design (`TestAdminCORS`).
+
+## ADR-0002: out-of-process workers, fencing tokens, traceparent (2026-09-22, Queue 4 Q5)
+
+Status: Accepted. Supersedes the "not in v1" parts of Decision 3 and the reserved `WorkerService` comment.
+
+**Decision.** Remote workers are implemented as `jobrun.v1.WorkerService` in `jobrund` (`internal/server/workers.go`)
+plus a client library `pkg/jobworker` and a binary `cmd/jobworker`. `Claim` is a bidirectional stream: the first
+message names the worker (`worker_id`, lease owner `remote:<worker_id>`) and its queues, and every message grants
+credits; the server claims through the same `Store.Claim` (SKIP LOCKED, attempts++, token++) and pushes at most as
+many jobs as granted. `Heartbeat`/`Complete`/`Fail` are unary and name a `Lease{job_id, token}`. No NATS: the
+`Dispatcher` seam (the `postgres.Notifier`) wakes the streams exactly as it wakes the in-process claim loops.
+
+**Fencing tokens (deviation from the frozen `job.Store` signatures).** `jobs.lease_token bigint` (migration 00005) is
+bumped by every claim, and heartbeat/complete/fail are guarded by `(status='leased', lease_owner, lease_token)`.
+Owner-only fencing had a hole: the same pool (same owner) could reclaim its own reaped job and the first attempt's
+heartbeat and `Complete` would still match. The port changed accordingly:
+`Heartbeat(ctx, owner, []Lease, until) (Renewal, error)`, `Complete(ctx, Lease, owner, Commit)`,
+`Fail(ctx, Lease, owner, cause, perm, retryAt)`; `Renewal{Kept, CancelRequested []Lease}` names leases, not ids,
+because one worker can hold two leases of the same job at once. In-flight maps (pool heartbeater, WorkerServer,
+jobworker) are keyed by lease for the same reason.
+
+**Delivery guarantees.** Remote handlers get at-least-once execution and at-least-once effects. `job.TxHandler`
+exactly-once stays in-process: its `Commit` must run inside the completion transaction, and a remote process
+cannot join a Postgres transaction held by `jobrund` (shipping SQL over the wire would turn the worker protocol into a
+remote database session). Remote handlers make effects idempotent by keying them on the job id.
+`cmd/jobworker` therefore exposes only plain `job.Handler`s.
+
+**Lost-lock detection.** Both the pool and `pkg/jobworker` fence a lease (cancel the handler ctx, never call
+`Complete`/`Fail`, count it) when a heartbeat verdict omits it, and fence locally when heartbeats keep failing past a
+conservative deadline: send time of the claim or of the last successful heartbeat, plus TTL, minus one heartbeat
+period, on the monotonic clock. Detection latency is one heartbeat period (TTL/3) for a stolen lease. A cancel
+request is not a fence: the handler is cancelled and its `Fail` still lands (the job ends `cancelled`).
+Metric: `jobrun_lease_fenced_total` (pool + leases WorkerService reported lost), in OTel and the `/metrics` text.
+
+**Traceparent.** `jobs.traceparent` stores the W3C context of the `jobrun.enqueue` span, which `JobServer.Enqueue`
+opens under the caller's trace (otelgrpc stats handler). The pool starts `jobrun.run` as its child (a child, not a
+link: enqueue -> run -> complete is one trace; retries are sibling run spans). Over `WorkerService` the traceparent
+rides in `LeasedJob`, the worker's run span is its child, and the run span's context comes back on
+`Complete`/`Fail` so the server's `jobrun.complete` is a child of the remote run span. The W3C propagator is used
+directly, so storing and extracting work with tracing disabled (nothing is stored when there is no valid span).
+
+**Other deviations.** `WorkerServer.Drain()` ends open `Claim` streams in teardown stage 1 before `GracefulStop`
+(long-lived streams would otherwise hold it for the full budget). Jobs claimed for a stream whose send fails are
+failed straight back to the queue (burning the attempt that the claim counted). `/admin/stats` `pool` now embeds the
+remote counters under `Remote`. `jobrun_lease_lost_total` includes remote refusals.
+
+**Tests.** Store: token fencing on reclaim by the same owner, traceparent round-trip (single and COPY enqueue).
+Pool: table-driven heartbeat verdicts (kept, cancel requested, lost, store unreachable -> local deadline), reclaim of the
+same job fencing only the old lease, run/complete spans in an in-memory exporter. Server: bufconn validation/fencing/
+fail-outcome/drain tables, enqueue traceparent through otelgrpc. Client: concurrency bound, failures, lost-lock table,
+trace propagation both ways, credit flow control. Integration (`cmd/jobworker`, real Postgres): a `jobworker` process
+is killed by PID mid-job -> lease expires -> reaper requeues -> a second worker completes with token+1; a live worker
+whose lease is reaped and reclaimed by itself fences attempt 1 (~one heartbeat later) and completes attempt 2.
+Fuzz: `server.FuzzWorkerLease`, `obs.FuzzWithTraceParent` (60 s each).
