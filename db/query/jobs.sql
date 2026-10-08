@@ -51,6 +51,28 @@ UPDATE jobs AS j
  WHERE j.id = ready.id
 RETURNING j.*;
 
+-- name: ClaimJobsOldest :many
+-- ClaimJobs in pure age order (run_at, id), ignoring priority: the anti-
+-- starvation claim taken every CLAIM_FIFO_EVERY-th time (index jobs_ready_fifo).
+WITH ready AS (
+    SELECT jobs.id FROM jobs
+     WHERE jobs.status = 'queued' AND jobs.queue = sqlc.arg('queue_name') AND jobs.run_at <= now()
+     ORDER BY jobs.run_at, jobs.id
+     LIMIT sqlc.arg('batch_limit')
+       FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs AS j
+   SET status = 'leased',
+       lease_owner = sqlc.arg('owner')::text,
+       lease_until = now() + sqlc.arg('ttl')::interval,
+       attempts = j.attempts + 1,
+       lease_token = j.lease_token + 1,
+       started_at = COALESCE(j.started_at, now()),
+       updated_at = now()
+  FROM ready
+ WHERE j.id = ready.id
+RETURNING j.*;
+
 -- name: HeartbeatLeases :many
 -- Returns the leases actually extended: (id, token) pairs zipped by the parallel
 -- unnest, guarded by owner and token. A lease that already expired is not revived

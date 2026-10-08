@@ -172,8 +172,8 @@ func TestMigrateIdempotent(t *testing.T) {
 	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM goose_db_version WHERE version_id > 0").Scan(&n); err != nil {
 		t.Fatalf("goose_db_version: %v", err)
 	}
-	if n != 5 {
-		t.Fatalf("applied migrations: want 5 got %d", n)
+	if n != 6 {
+		t.Fatalf("applied migrations: want 6 got %d", n)
 	}
 }
 
@@ -411,6 +411,42 @@ func TestClaimOrderAndReadiness(t *testing.T) {
 	}
 	if _, err := s.Claim(context.Background(), job.ClaimQuery{Queue: "p"}); !errors.Is(err, job.ErrInvalidArgument) {
 		t.Fatalf("Claim without owner/limit/ttl: want ErrInvalidArgument got %v", err)
+	}
+}
+
+// TestClaimFIFOEveryBoundsStarvation: with strict priority a steady stream of
+// high-priority work never lets an old low-priority job run; with
+// WithFIFOEvery(3) every third claim takes the oldest ready job, so the low
+// one is claimed by the third claim at the latest.
+func TestClaimFIFOEveryBoundsStarvation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		every   int
+		lowByAt int // 1-based claim that takes the low job; 0 = never within 9 claims
+	}{{every: 0, lowByAt: 0}, {every: 3, lowByAt: 3}} {
+		t.Run(fmt.Sprintf("every=%d", tc.every), func(t *testing.T) {
+			t.Parallel()
+			s, pool := newStore(t, postgres.WithFIFOEvery(tc.every))
+			low := mustEnqueue(t, s, newJob(t, "f", func(n *job.NewJob) { n.Priority = -100 }))
+			// Make the low job unambiguously the oldest.
+			if _, err := pool.Exec(context.Background(), "UPDATE jobs SET run_at = now() - interval '1 hour' WHERE id = $1", low.ID); err != nil {
+				t.Fatal(err)
+			}
+			for range 9 {
+				mustEnqueue(t, s, newJob(t, "f", func(n *job.NewJob) { n.Priority = 100 }))
+			}
+			got := 0
+			for i := 1; i <= 9; i++ {
+				c := mustClaim(t, s, "f", "w", 1, time.Minute)
+				if len(c) == 1 && c[0].ID == low.ID {
+					got = i
+					break
+				}
+			}
+			if got != tc.lowByAt {
+				t.Fatalf("low-priority job claimed at claim %d, want %d", got, tc.lowByAt)
+			}
+		})
 	}
 }
 

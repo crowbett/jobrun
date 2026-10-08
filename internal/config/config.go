@@ -52,9 +52,12 @@ type Config struct {
 
 // Worker tunes the in-process pool.
 type Worker struct {
-	Queues         []string      // WORKER_QUEUES, comma list, default "default"
-	Concurrency    int           // WORKER_CONCURRENCY, default 16
-	BatchSize      int           // WORKER_BATCH, default 32
+	Queues      []string // WORKER_QUEUES, comma list, default "default"
+	Concurrency int      // WORKER_CONCURRENCY, default 16
+	BatchSize   int      // WORKER_BATCH, default 32
+	// FIFOEvery (CLAIM_FIFO_EVERY, default 10): every n-th claim per queue
+	// takes the oldest ready jobs regardless of priority; 0 = strict priority.
+	FIFOEvery      int
 	LeaseTTL       time.Duration // LEASE_TTL, default 30s
 	HeartbeatEvery time.Duration // HEARTBEAT_EVERY, default 10s
 	JobTimeout     time.Duration // JOB_TIMEOUT, default 10m
@@ -94,7 +97,7 @@ func Load() (Config, error) {
 		LogFormat:        strings.ToLower(getenv("LOG_FORMAT", "json")),
 		StopTimeout:      15 * time.Second,
 		Worker: Worker{
-			Queues: splitList(getenv("WORKER_QUEUES", "default")), Concurrency: 16, BatchSize: 32,
+			Queues: splitList(getenv("WORKER_QUEUES", "default")), Concurrency: 16, BatchSize: 32, FIFOEvery: 10,
 			LeaseTTL: 30 * time.Second, HeartbeatEvery: 10 * time.Second, JobTimeout: 10 * time.Minute,
 			PollFloor: 200 * time.Millisecond, Events: strings.ToLower(getenv("JOB_EVENTS", "all")),
 		},
@@ -130,6 +133,7 @@ func Load() (Config, error) {
 	}{
 		{"WORKER_CONCURRENCY", &cfg.Worker.Concurrency},
 		{"WORKER_BATCH", &cfg.Worker.BatchSize},
+		{"CLAIM_FIFO_EVERY", &cfg.Worker.FIFOEvery},
 		{"REAPER_BATCH", &cfg.Reaper.Batch},
 		{"PGX_MAX_CONNS", &cfg.PGMaxConns},
 	}
@@ -198,6 +202,9 @@ func (c Config) Validate() error {
 	}
 	if c.Worker.Concurrency < 1 || c.Worker.Concurrency > 1024 {
 		errs = append(errs, fmt.Errorf("WORKER_CONCURRENCY must be 1..1024, got %d", c.Worker.Concurrency))
+	}
+	if c.Worker.FIFOEvery < 0 || c.Worker.FIFOEvery == 1 {
+		errs = append(errs, fmt.Errorf("CLAIM_FIFO_EVERY must be 0 (off) or >= 2, got %d (1 would ignore priority entirely)", c.Worker.FIFOEvery))
 	}
 	if c.Worker.BatchSize < 1 || c.Worker.BatchSize > 1000 {
 		errs = append(errs, fmt.Errorf("WORKER_BATCH must be 1..1000, got %d", c.Worker.BatchSize))

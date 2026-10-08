@@ -120,7 +120,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("JOB_EVENTS: %w", err)
 	}
-	store := postgres.NewStore(pool, logger, postgres.WithEventMode(mode))
+	store := postgres.NewStore(pool, logger, postgres.WithEventMode(mode), postgres.WithFIFOEvery(cfg.Worker.FIFOEvery))
 	warnClockSkew(startCtx, store, logger)
 	notifier := postgres.NewNotifier(pool, logger, postgres.WithPollFloor(cfg.Worker.PollFloor))
 	locker := postgres.NewLocker(pool)

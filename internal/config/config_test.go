@@ -44,6 +44,17 @@ func TestLoadTable(t *testing.T) {
 			},
 		},
 		{name: "missing db", env: map[string]string{"DATABASE_URL": ""}, wantErr: "DATABASE_URL is required"},
+		{name: "fifo every 1 refused", env: map[string]string{"CLAIM_FIFO_EVERY": "1"}, wantErr: "CLAIM_FIFO_EVERY must be 0 (off) or >= 2"},
+		{
+			name: "fifo default and off",
+			env:  map[string]string{"CLAIM_FIFO_EVERY": "0"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.Worker.FIFOEvery != 0 {
+					t.Errorf("CLAIM_FIFO_EVERY=0 not applied: %d", c.Worker.FIFOEvery)
+				}
+			},
+		},
 		{name: "prod grpc wildcard without token refused", env: map[string]string{"APP_ENV": "prod", "GRPC_ADDR": ":50052"}, wantErr: "GRPC_TOKEN is empty"},
 		{name: "short grpc token refused", env: map[string]string{"GRPC_TOKEN": "short"}, wantErr: "GRPC_TOKEN must be at least"},
 		{

@@ -128,6 +128,83 @@ func (q *Queries) ClaimJobs(ctx context.Context, arg ClaimJobsParams) ([]Job, er
 	return items, nil
 }
 
+const claimJobsOldest = `-- name: ClaimJobsOldest :many
+WITH ready AS (
+    SELECT jobs.id FROM jobs
+     WHERE jobs.status = 'queued' AND jobs.queue = $3 AND jobs.run_at <= now()
+     ORDER BY jobs.run_at, jobs.id
+     LIMIT $4
+       FOR UPDATE SKIP LOCKED
+)
+UPDATE jobs AS j
+   SET status = 'leased',
+       lease_owner = $1::text,
+       lease_until = now() + $2::interval,
+       attempts = j.attempts + 1,
+       lease_token = j.lease_token + 1,
+       started_at = COALESCE(j.started_at, now()),
+       updated_at = now()
+  FROM ready
+ WHERE j.id = ready.id
+RETURNING j.id, j.queue, j.type, j.payload, j.status, j.priority, j.run_at, j.attempts, j.max_attempts, j.backoff, j.lease_owner, j.lease_until, j.last_error, j.idempotency_key, j.cancel_requested, j.created_at, j.updated_at, j.started_at, j.finished_at, j.lease_token, j.traceparent
+`
+
+type ClaimJobsOldestParams struct {
+	Owner      string
+	Ttl        pgtype.Interval
+	QueueName  string
+	BatchLimit int32
+}
+
+// ClaimJobs in pure age order (run_at, id), ignoring priority: the anti-
+// starvation claim taken every CLAIM_FIFO_EVERY-th time (index jobs_ready_fifo).
+func (q *Queries) ClaimJobsOldest(ctx context.Context, arg ClaimJobsOldestParams) ([]Job, error) {
+	rows, err := q.db.Query(ctx, claimJobsOldest,
+		arg.Owner,
+		arg.Ttl,
+		arg.QueueName,
+		arg.BatchLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Job{}
+	for rows.Next() {
+		var i Job
+		if err := rows.Scan(
+			&i.ID,
+			&i.Queue,
+			&i.Type,
+			&i.Payload,
+			&i.Status,
+			&i.Priority,
+			&i.RunAt,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.Backoff,
+			&i.LeaseOwner,
+			&i.LeaseUntil,
+			&i.LastError,
+			&i.IdempotencyKey,
+			&i.CancelRequested,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.LeaseToken,
+			&i.Traceparent,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const completeJob = `-- name: CompleteJob :one
 UPDATE jobs
    SET status = (CASE WHEN cancel_requested THEN 'cancelled' ELSE 'succeeded' END)::job_status,

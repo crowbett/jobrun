@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -38,6 +39,11 @@ type Store struct {
 	events        EventMode
 	commitTimeout time.Duration
 	channel       string
+
+	// fifoEvery > 0 makes every fifoEvery-th claim per queue a ClaimJobsOldest.
+	fifoEvery uint64
+	claimsMu  sync.Mutex
+	claims    map[string]uint64 // per-queue claim counter
 }
 
 var _ job.Store = (*Store)(nil)
@@ -56,6 +62,33 @@ func WithCommitTimeout(d time.Duration) Option { return func(s *Store) { s.commi
 // inside its enqueue transactions; "" disables the in-transaction notify
 // (PollOnly deployments). The default is NotifyChannel.
 func WithNotifyChannel(name string) Option { return func(s *Store) { s.channel = name } }
+
+// WithFIFOEvery makes every n-th claim per queue take the oldest ready jobs
+// regardless of priority (CLAIM_FIFO_EVERY), bounding priority starvation: a
+// low-priority job waits at most for the jobs older than it to be claimed by
+// the one-in-n FIFO claims. 0 (the default) disables it: strict priority.
+func WithFIFOEvery(n int) Option {
+	return func(s *Store) {
+		if n > 0 {
+			s.fifoEvery = uint64(n)
+		}
+	}
+}
+
+// fifoTurn reports whether this claim on queue is the FIFO one.
+func (s *Store) fifoTurn(queue string) bool {
+	if s.fifoEvery == 0 {
+		return false
+	}
+	s.claimsMu.Lock()
+	defer s.claimsMu.Unlock()
+	if s.claims == nil {
+		s.claims = map[string]uint64{}
+	}
+	n := s.claims[queue] + 1
+	s.claims[queue] = n
+	return n%s.fifoEvery == 0
+}
 
 // NewStore returns a Store over pool.
 func NewStore(pool *pgxpool.Pool, log *slog.Logger, opts ...Option) *Store {
@@ -266,8 +299,14 @@ func (s *Store) Claim(ctx context.Context, q job.ClaimQuery) ([]job.Job, error) 
 		return nil, fmt.Errorf("%w: claim needs a positive limit, an owner and a lease ttl", job.ErrInvalidArgument)
 	}
 	params := sqlc.ClaimJobsParams{QueueName: q.Queue, Owner: q.Owner, BatchLimit: q.Limit, Ttl: interval(q.LeaseTTL)}
+	claim := func(qq *sqlc.Queries) ([]sqlc.Job, error) { return qq.ClaimJobs(ctx, params) }
+	if s.fifoTurn(q.Queue) {
+		claim = func(qq *sqlc.Queries) ([]sqlc.Job, error) {
+			return qq.ClaimJobsOldest(ctx, sqlc.ClaimJobsOldestParams(params))
+		}
+	}
 	if !s.events.records(job.StatusLeased) {
-		rows, err := s.q.ClaimJobs(ctx, params)
+		rows, err := claim(s.q)
 		if err != nil {
 			return nil, fmt.Errorf("claim jobs: %w", err)
 		}
@@ -275,7 +314,7 @@ func (s *Store) Claim(ctx context.Context, q job.ClaimQuery) ([]job.Job, error) 
 	}
 	var out []job.Job
 	err := s.withTx(ctx, func(qq *sqlc.Queries, _ pgx.Tx) error {
-		rows, err := qq.ClaimJobs(ctx, params)
+		rows, err := claim(qq)
 		if err != nil {
 			return fmt.Errorf("claim jobs: %w", err)
 		}
