@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/crowbett/jobrun/internal/handlers"
+	"github.com/crowbett/jobrun/internal/interceptor"
 	"github.com/crowbett/jobrun/internal/job"
 	"github.com/crowbett/jobrun/internal/obs"
 	"github.com/crowbett/jobrun/pkg/jobworker"
@@ -113,10 +114,15 @@ func run(args []string) error {
 		_ = otelStop(fctx)
 	}()
 
-	conn, err := grpc.NewClient(o.addr,
+	dial := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
-	)
+	}
+	// GRPC_TOKEN from the environment only (a flag would be visible in the process list).
+	if tok := os.Getenv("GRPC_TOKEN"); tok != "" {
+		dial = append(dial, grpc.WithPerRPCCredentials(interceptor.Bearer(tok)))
+	}
+	conn, err := grpc.NewClient(o.addr, dial...)
 	if err != nil {
 		return fmt.Errorf("dial %s: %w", o.addr, err)
 	}

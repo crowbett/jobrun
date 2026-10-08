@@ -197,6 +197,10 @@ func run() error {
 	}
 
 	// --- gRPC --------------------------------------------------------------------
+	if cfg.GRPCOpen() {
+		logger.Warn("gRPC is reachable beyond loopback without GRPC_TOKEN: anyone who can connect can enqueue, lease and read jobs",
+			slog.String("grpc_addr", cfg.GRPCAddr), slog.String("env", cfg.Env))
+	}
 	lis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.GRPCAddr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.GRPCAddr, err)
@@ -211,12 +215,14 @@ func run() error {
 		grpc.ChainUnaryInterceptor(
 			interceptor.UnaryRecover(logger), // outermost: catches panics from everything below
 			interceptor.UnaryRequestID(),
-			interceptor.UnaryLogging(logger),
+			interceptor.UnaryLogging(logger), // logs rejected calls too
+			interceptor.UnaryAuth(cfg.GRPCToken),
 		),
 		grpc.ChainStreamInterceptor(
 			interceptor.StreamRecover(logger),
 			interceptor.StreamRequestID(),
 			interceptor.StreamLogging(logger),
+			interceptor.StreamAuth(cfg.GRPCToken),
 		),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			MaxConnectionIdle: 5 * time.Minute,

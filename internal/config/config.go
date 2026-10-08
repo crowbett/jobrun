@@ -20,7 +20,11 @@ type Config struct {
 	ServiceName string // SERVICE_NAME, default "jobrun"
 	Env         string // APP_ENV: dev | staging | prod
 	GRPCAddr    string // GRPC_ADDR, default ":50052"
-	AdminAddr   string // ADMIN_ADDR, default "127.0.0.1:9110"
+	// GRPCToken (GRPC_TOKEN) is the bearer token every gRPC call except the
+	// health service must carry. Empty disables the check, which Validate
+	// allows outside prod or on a loopback GRPC_ADDR only.
+	GRPCToken string
+	AdminAddr string // ADMIN_ADDR, default "127.0.0.1:9110"
 	// AdminAllowRemote (ADMIN_ALLOW_REMOTE) permits an ADMIN_ADDR that is not
 	// a loopback address. The admin surface has no authentication, so
 	// Validate refuses a non-loopback bind unless this is set (a container
@@ -83,6 +87,7 @@ func Load() (Config, error) {
 		ServiceName:      getenv("SERVICE_NAME", "jobrun"),
 		Env:              getenv("APP_ENV", "dev"),
 		GRPCAddr:         getenv("GRPC_ADDR", ":50052"),
+		GRPCToken:        os.Getenv("GRPC_TOKEN"),
 		AdminAddr:        getenv("ADMIN_ADDR", "127.0.0.1:9110"),
 		AdminCORSOrigins: splitList(os.Getenv("ADMIN_CORS_ORIGINS")),
 		DatabaseURL:      os.Getenv("DATABASE_URL"),
@@ -163,8 +168,13 @@ func (c Config) Validate() error {
 	if c.DatabaseURL == "" {
 		errs = append(errs, errors.New("DATABASE_URL is required"))
 	}
-	if c.GRPCAddr == "" {
+	switch {
+	case c.GRPCAddr == "":
 		errs = append(errs, errors.New("GRPC_ADDR must not be empty"))
+	case c.GRPCToken != "" && len(c.GRPCToken) < MinGRPCTokenLen:
+		errs = append(errs, fmt.Errorf("GRPC_TOKEN must be at least %d characters", MinGRPCTokenLen))
+	case c.GRPCToken == "" && c.Env == "prod" && !IsLoopbackAddr(c.GRPCAddr):
+		errs = append(errs, fmt.Errorf("GRPC_ADDR %q is not a loopback address and GRPC_TOKEN is empty: in prod anyone who can reach it could enqueue and lease jobs; set GRPC_TOKEN or bind 127.0.0.1", c.GRPCAddr))
 	}
 	switch {
 	case c.AdminAddr == "":
@@ -223,6 +233,16 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("OTEL_EXPORTER_OTLP_ENDPOINT is required when OTEL_ENABLED=true"))
 	}
 	return errors.Join(errs...)
+}
+
+// MinGRPCTokenLen is the shortest GRPC_TOKEN accepted (a guessable token is
+// no better than none).
+const MinGRPCTokenLen = 16
+
+// GRPCOpen reports whether the gRPC surface is reachable beyond loopback
+// without a token (allowed outside prod; jobrund warns at startup).
+func (c Config) GRPCOpen() bool {
+	return c.GRPCToken == "" && !IsLoopbackAddr(c.GRPCAddr)
 }
 
 // IsLoopbackAddr reports whether a host:port listen address binds only a

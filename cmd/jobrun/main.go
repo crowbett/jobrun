@@ -32,6 +32,7 @@ import (
 	healthv1 "google.golang.org/grpc/health/grpc_health_v1"
 
 	jobrunv1 "github.com/crowbett/jobrun/gen/jobrun/v1"
+	"github.com/crowbett/jobrun/internal/interceptor"
 )
 
 const usage = `usage: jobrun [-addr host:port] [-timeout 5s] <command> [flags]
@@ -93,7 +94,12 @@ func run(args []string) error {
 	}
 	sub, rest := global.Arg(0), global.Args()[1:]
 
-	conn, err := grpc.NewClient(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// The token comes from the environment only: a flag would show it in the process list.
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	if tok := os.Getenv("GRPC_TOKEN"); tok != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(interceptor.Bearer(tok)))
+	}
+	conn, err := grpc.NewClient(*addr, opts...)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

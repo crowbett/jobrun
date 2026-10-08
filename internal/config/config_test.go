@@ -44,6 +44,38 @@ func TestLoadTable(t *testing.T) {
 			},
 		},
 		{name: "missing db", env: map[string]string{"DATABASE_URL": ""}, wantErr: "DATABASE_URL is required"},
+		{name: "prod grpc wildcard without token refused", env: map[string]string{"APP_ENV": "prod", "GRPC_ADDR": ":50052"}, wantErr: "GRPC_TOKEN is empty"},
+		{name: "short grpc token refused", env: map[string]string{"GRPC_TOKEN": "short"}, wantErr: "GRPC_TOKEN must be at least"},
+		{
+			name: "prod grpc loopback without token",
+			env:  map[string]string{"APP_ENV": "prod", "GRPC_ADDR": "127.0.0.1:50052"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.GRPCOpen() {
+					t.Error("loopback bind reported as open")
+				}
+			},
+		},
+		{
+			name: "prod grpc wildcard with token",
+			env:  map[string]string{"APP_ENV": "prod", "GRPC_ADDR": ":50052", "GRPC_TOKEN": "0123456789abcdef"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if c.GRPCToken != "0123456789abcdef" || c.GRPCOpen() {
+					t.Errorf("token not applied: open=%v", c.GRPCOpen())
+				}
+			},
+		},
+		{
+			name: "dev grpc wildcard without token is allowed but open",
+			env:  map[string]string{"GRPC_ADDR": ":50052"},
+			check: func(t *testing.T, c Config) {
+				t.Helper()
+				if !c.GRPCOpen() {
+					t.Error("wildcard without token not reported as open")
+				}
+			},
+		},
 		{name: "admin wildcard refused", env: map[string]string{"ADMIN_ADDR": ":9110"}, wantErr: "ADMIN_ADDR \":9110\" is not a loopback address"},
 		{name: "admin 0.0.0.0 refused", env: map[string]string{"ADMIN_ADDR": "0.0.0.0:9110"}, wantErr: "not a loopback address"},
 		{name: "admin lan ip refused", env: map[string]string{"ADMIN_ADDR": "192.168.1.5:9110"}, wantErr: "not a loopback address"},
