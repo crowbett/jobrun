@@ -156,6 +156,7 @@ Reflection is on, so `grpcurl -plaintext localhost:50052 list` works too.
 | `PGX_MAX_CONNS` | `WORKER_CONCURRENCY + 8` | must be >= concurrency + 2 |
 | `WORKER_QUEUES` | `default` | comma list; `task run` uses `default,bench` |
 | `WORKER_CONCURRENCY` / `WORKER_BATCH` | `16` / `32` | handler goroutines / jobs per claim |
+| `CLAIM_FIFO_EVERY` | `10` | every n-th claim per queue takes the oldest ready jobs regardless of priority (anti-starvation; index `jobs_ready_fifo`); `0` = strict priority |
 | `LEASE_TTL` / `HEARTBEAT_EVERY` | `30s` / `10s` | heartbeat must be < TTL/2; reaper ticks TTL/3 |
 | `JOB_TIMEOUT` | `10m` | per handler, also the pool's own drain budget |
 | `POLL_FLOOR` | `200ms` | claim tick when NOTIFY is silent |
@@ -266,8 +267,9 @@ the integration tests, `buf lint`, and `buf generate` leaving `gen/` unchanged.
 
 ## Not done yet
 
-- Authentication on `WorkerService` (like the rest of the gRPC surface, anyone who can reach :50052
-  can lease jobs and read their payloads).
+- Per-client identities on gRPC: `GRPC_TOKEN` is one shared bearer token, and there is no TLS (see
+  "gRPC authentication").
 - Lost-lock detection in the scheduler beyond re-election on the next tick.
-- Priority starvation: `ORDER BY priority DESC` lets a flood of high-priority jobs starve low ones.
+- Priority is bounded, not weighted: with `CLAIM_FIFO_EVERY=n` a low-priority job is never starved, but it only
+  advances through the 1-in-n age-ordered claims (no per-priority quotas or aging of the priority itself).
 - Per-queue concurrency limits (one `WORKER_CONCURRENCY` covers every queue).

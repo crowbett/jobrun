@@ -411,3 +411,19 @@ defaulted to every interface. Now:
 - Tests: `interceptor.TestUnaryAuth` / `TestStreamAuth` (missing, wrong, prefix, duplicate header, health, disabled)
   and `server.TestAuthOnTheWire` (bufconn, real JobService + WorkerService + health: no token / wrong / right; the
   Claim stream is refused without it; health stays open).
+
+## Anti-starvation claims (2026-10-07)
+
+`ORDER BY priority DESC, run_at, id` let a steady flood of high-priority jobs starve low-priority ones forever.
+Rejected: ordering by an aged priority (`priority + age / step`) - an expression no index can serve, so every claim
+would sort the whole ready set of the queue. Built instead:
+
+- `ClaimJobsOldest` (same CTE + SKIP LOCKED + lease update as `ClaimJobs`, ordered by `run_at, id` only) on the new
+  partial index `jobs_ready_fifo (queue, run_at, id) WHERE status = 'queued'` (migration 00006, `CREATE INDEX
+  CONCURRENTLY`, so it does not block a live queue).
+- `postgres.WithFIFOEvery(n)` / `CLAIM_FIFO_EVERY` (default 10, `0` = strict priority, `1` refused): every n-th
+  `Store.Claim` per queue (a mutex-guarded per-queue counter in the Store, so in-process and WorkerService claims
+  share the rotation) uses `ClaimJobsOldest`. A low-priority job therefore waits at most for the jobs older than it to
+  drain through the 1-in-n FIFO claims; the other n-1 claims keep strict priority.
+- Test: `TestClaimFIFOEveryBoundsStarvation` (integration): one hour-old priority -100 job and nine priority 100
+  jobs, batch 1 - strict priority never claims it in 9 claims, `every=3` claims it on the 3rd.
