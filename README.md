@@ -150,6 +150,7 @@ Reflection is on, so `grpcurl -plaintext localhost:50052 list` works too.
 | --- | --- | --- |
 | `DATABASE_URL` | required | `postgres://jobrun:jobrun@localhost:5434/jobrun?sslmode=disable` locally |
 | `GRPC_ADDR` / `ADMIN_ADDR` | `:50052` / `127.0.0.1:9110` | ports frozen in docs/PLAN.md |
+| `GRPC_TOKEN` | empty | bearer token for every gRPC call except `grpc.health.v1.Health` (>= 16 chars); the `jobrun` CLI and `jobworker` read the same variable. Empty is refused in `APP_ENV=prod` unless `GRPC_ADDR` is loopback; elsewhere `jobrund` warns at startup |
 | `ADMIN_ALLOW_REMOTE` | `false` | the admin surface has no auth: a non-loopback `ADMIN_ADDR` is refused unless this is `true` (the Dockerfile sets it) |
 | `ADMIN_CORS_ORIGINS` | empty | comma list of exact origins (`http://localhost:3000`) allowed to read `/admin/stats` and `/admin/events` cross-origin; empty sends no CORS header |
 | `PGX_MAX_CONNS` | `WORKER_CONCURRENCY + 8` | must be >= concurrency + 2 |
@@ -164,6 +165,15 @@ Reflection is on, so `grpcurl -plaintext localhost:50052 list` works too.
 | `SHUTDOWN_TIMEOUT` | `15s` | stage 1 budget (gRPC + admin drain) |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | |
 | `OTEL_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT` | `false` / `http://localhost:4317` | traces + metrics to the devstack collector |
+
+## gRPC authentication
+
+With `GRPC_TOKEN` set, every gRPC call (JobService, ScheduleService, WorkerService, reflection) must carry
+`authorization: Bearer <token>`; anything else gets `Unauthenticated`. Only `grpc.health.v1.Health` stays open, for
+probes. The comparison is constant-time over sha256 of both sides. It is one shared token, not per-client identity,
+and the transport is plaintext, so the token crosses the wire in clear: put TLS (or a private network) in front when
+jobrund is reachable off-host. Without a token (the dev default, `GRPC_ADDR=:50052` on every interface) anyone who
+can reach the port can enqueue, lease and read jobs; `APP_ENV=prod` refuses to start that way.
 
 ## Admin, metrics, SSE
 

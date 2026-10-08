@@ -393,3 +393,21 @@ trace propagation both ways, credit flow control. Integration (`cmd/jobworker`, 
 is killed by PID mid-job -> lease expires -> reaper requeues -> a second worker completes with token+1; a live worker
 whose lease is reaped and reclaimed by itself fences attempt 1 (~one heartbeat later) and completes attempt 2.
 Fuzz: `server.FuzzWorkerLease`, `obs.FuzzWithTraceParent` (60 s each).
+
+## gRPC bearer token (2026-10-07)
+
+The gRPC surface (JobService, ScheduleService, WorkerService, reflection) had no authentication while `GRPC_ADDR`
+defaulted to every interface. Now:
+
+- `GRPC_TOKEN` (>= 16 chars): `interceptor.UnaryAuth` / `StreamAuth` (innermost in both chains, so rejected calls are
+  still logged with their request id) require `authorization: Bearer <token>`. Both sides are sha256-hashed and
+  compared with `subtle.ConstantTimeCompare`, so timing does not depend on the presented length; the error never
+  echoes the token. `grpc.health.v1.Health/*` stays open for kubelet / grpc_health_probe.
+- Clients: `interceptor.Bearer` is the `credentials.PerRPCCredentials` the `jobrun` CLI and `jobworker` add when
+  `GRPC_TOKEN` is set (environment only, never a flag: a flag shows in the process list). `RequireTransportSecurity`
+  is false because the transport is plaintext by design; TLS stays a deployment concern.
+- `config.Validate`: in `APP_ENV=prod` an empty token is refused unless `GRPC_ADDR` is loopback. Dev and staging keep
+  working without one, with a startup warning (`Config.GRPCOpen`).
+- Tests: `interceptor.TestUnaryAuth` / `TestStreamAuth` (missing, wrong, prefix, duplicate header, health, disabled)
+  and `server.TestAuthOnTheWire` (bufconn, real JobService + WorkerService + health: no token / wrong / right; the
+  Claim stream is refused without it; health stays open).
