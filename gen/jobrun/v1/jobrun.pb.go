@@ -2903,7 +2903,7 @@ const file_jobrun_v1_jobrun_proto_rawDesc = "" +
 	"\x05Claim\x12\x17.jobrun.v1.ClaimRequest\x1a\x18.jobrun.v1.ClaimResponse\"\x00(\x010\x01\x12H\n" +
 	"\tHeartbeat\x12\x1b.jobrun.v1.HeartbeatRequest\x1a\x1c.jobrun.v1.HeartbeatResponse\"\x00\x12E\n" +
 	"\bComplete\x12\x1a.jobrun.v1.CompleteRequest\x1a\x1b.jobrun.v1.CompleteResponse\"\x00\x129\n" +
-	"\x04Fail\x12\x16.jobrun.v1.FailRequest\x1a\x17.jobrun.v1.FailResponse\"\x00B?Z=github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1b\x06proto3"
+	"\x04Fail\x12\x16.jobrun.v1.FailRequest\x1a\x17.jobrun.v1.FailResponse\"\x00B3Z1github.com/crowbett/jobrun/gen/jobrun/v1;jobrunv1b\x06proto3"
 
 var (
 	file_jobrun_v1_jobrun_proto_rawDescOnce sync.Once
