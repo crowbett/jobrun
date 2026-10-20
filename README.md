@@ -1,5 +1,7 @@
 # jobrun
 
+[![ci](https://github.com/crowbett/jobrun/actions/workflows/ci.yml/badge.svg)](https://github.com/crowbett/jobrun/actions/workflows/ci.yml) [![Go Reference](https://pkg.go.dev/badge/github.com/crowbett/jobrun.svg)](https://pkg.go.dev/github.com/crowbett/jobrun) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A durable job queue on Postgres, in one Go binary: gRPC control plane, in-process worker pool
 with fenced leases, out-of-process workers over `WorkerService` (`pkg/jobworker`, `cmd/jobworker`),
 cron scheduler, retries with backoff, a dead-letter state you can `retry`, exactly-once side
@@ -273,3 +275,7 @@ the integration tests, `buf lint`, and `buf generate` leaving `gen/` unchanged.
 - Priority is bounded, not weighted: with `CLAIM_FIFO_EVERY=n` a low-priority job is never starved, but it only
   advances through the 1-in-n age-ordered claims (no per-priority quotas or aging of the priority itself).
 - Per-queue concurrency limits (one `WORKER_CONCURRENCY` covers every queue).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
