@@ -4,7 +4,7 @@ Durable job queue on Postgres: gRPC control plane + in-process worker pool + cro
 `/admin` SSE page in one binary (`jobrund`), with a `jobrun` CLI and an out-of-process `jobworker` over
 `WorkerService`. Design record: `docs/PLAN.md` (ADR-0001, ADR-0002 for remote workers / fencing tokens / traceparent);
 read it before touching a port or a signature - they are frozen there.
-Module `github.com/crowbett/jobrun`, Go 1.27. Global Go conventions from `~/.claude/CLAUDE.md` apply.
+Module `github.com/crowbett/jobrun`, Go 1.27. Global Go conventions from the author's user-level `CLAUDE.md` apply.
 
 ## Layout
 - `proto/jobrun/v1/jobrun.proto` - JobService + ScheduleService + WorkerService (Claim stream, Heartbeat/Complete/Fail with `Lease{job_id, token}`). `buf lint` + `buf breaking`.

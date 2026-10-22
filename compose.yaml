@@ -3,9 +3,9 @@
 #   docker compose up -d --wait
 #   task migrate          # goose up against DATABASE_URL
 #
-# Observability is NOT duplicated here: bring up the shared devstack instead
-# (`cd ~/dev/_templates/docker-stack; docker compose --profile obs up -d --wait`)
-# and point OTEL_EXPORTER_OTLP_ENDPOINT at its collector on localhost:4317.
+# Observability is NOT duplicated here: run any OTLP collector (e.g. an OTel Collector +
+# Grafana/Tempo/Prometheus stack) separately
+# and point OTEL_EXPORTER_OTLP_ENDPOINT at it (default localhost:4317).
 name: jobrun
 
 services:
