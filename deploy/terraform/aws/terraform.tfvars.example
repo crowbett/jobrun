@@ -1,0 +1,13 @@
+# cp terraform.tfvars.example terraform.tfvars, then edit. Nothing here has been applied.
+region      = "us-east-1"
+name        = "jobrun"
+environment = "dev"
+
+cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"] # your egress IP
+
+node_instance_types = ["t3.medium"]
+node_desired_size   = 2
+
+db_instance_class      = "db.t4g.small"
+db_multi_az            = false
+db_deletion_protection = true
