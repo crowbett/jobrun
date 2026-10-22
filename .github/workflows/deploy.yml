@@ -1,0 +1,90 @@
+name: deploy
+
+# Static checks for deploy/: the Helm chart and the AWS Terraform. Nothing here talks to a
+# cluster or an AWS account (no credentials are configured, terraform runs without a backend).
+on:
+  push:
+    branches: [main]
+    paths: ["deploy/**", ".github/workflows/deploy.yml"]
+  pull_request:
+    paths: ["deploy/**", ".github/workflows/deploy.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KUBECONFORM_VERSION: v0.8.0
+  K8S_VERSION: 1.33.0 # schema version kubeconform validates against (chart needs >= 1.30)
+
+jobs:
+  helm:
+    name: helm lint + template + kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - name: install kubeconform
+        run: |
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin kubeconform
+          kubeconform -v
+      - name: helm lint (every values file)
+        run: |
+          for f in deploy/helm/jobrun/ci/*.yaml deploy/local/values-kind.yaml; do
+            echo "::group::lint $f"
+            helm lint --strict deploy/helm/jobrun -f "$f"
+            echo "::endgroup::"
+          done
+      - name: render + kubeconform
+        run: |
+          mkdir -p rendered
+          helm template jobrun deploy/helm/jobrun -n jobrun -f deploy/helm/jobrun/ci/full-values.yaml > rendered/full.yaml
+          helm template jobrun deploy/helm/jobrun -n jobrun -f deploy/local/values-kind.yaml > rendered/kind.yaml
+          kubeconform -strict -summary -kubernetes-version "$K8S_VERSION" rendered/*.yaml deploy/local/postgres.yaml
+      - name: render-time validation rejects unsafe values
+        run: |
+          set +e
+          check() { # $1 = expected error substring, rest = extra helm args; the render must fail with it
+            want=$1; shift
+            if helm template t deploy/helm/jobrun "$@" >/dev/null 2>err.txt; then
+              echo "::error::render passed, expected failure containing: $want"; exit 1
+            fi
+            grep -qF "$want" err.txt || { echo "::error::wrong failure (want '$want'):"; cat err.txt; exit 1; }
+            echo "ok, rejected: $(head -n1 err.txt)"
+          }
+          check "set database.existingSecret"
+          check "server.terminationGracePeriodSeconds (30)" --set database.url=x --set server.terminationGracePeriodSeconds=30
+          check "worker.terminationGracePeriodSeconds (20)" --set database.url=x --set worker.terminationGracePeriodSeconds=20
+          check "server.pgMaxConns must be" --set database.url=x --set server.pgMaxConns=4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rendered-manifests
+          path: rendered/
+
+  terraform:
+    name: terraform fmt + validate + tflint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/terraform/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.4
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false -input=false -lockfile=readonly
+      - run: terraform validate
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.64.0
+      - run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids GitHub API rate limits downloading the aws ruleset
+      - run: tflint --format compact
