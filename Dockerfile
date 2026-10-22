@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/jobrund ./cmd/jobrund
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/ ./cmd/jobrund ./cmd/jobworker ./cmd/jobrun
 
 # ---------- runtime ----------
 # distroless/static: no shell, no package manager, runs as uid 65532 (nonroot).
@@ -24,7 +24,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # grpc.health.v1.Health/Check (k8s: `grpc: { port: 50052 }`) or grpc_health_probe.
 FROM gcr.io/distroless/static-debian12:nonroot
 
-COPY --from=builder /out/jobrund /jobrund
+# jobrund is the entrypoint; jobworker (remote worker Deployment in deploy/helm) and the
+# jobrun CLI (kubectl exec ... /jobrun enqueue) ride along in the same image.
+COPY --from=builder /out/jobrund /out/jobworker /out/jobrun /
 
 # ADMIN_ADDR binds every interface here so the page is reachable through
 # the container's published port; the admin surface has no auth, so
