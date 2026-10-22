@@ -1,0 +1,79 @@
+# Throwaway Postgres 17 for the kind demo (same image and initdb flags as compose.yaml).
+# Not for production: one replica, password in a plain Secret. On AWS the chart points at
+# RDS instead (deploy/terraform/aws).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: jobrun
+  POSTGRES_PASSWORD: jobrun-local-only
+  POSTGRES_DB: jobrun
+  # Consumed by the chart via database.existingSecret=postgres, database.secretKey=DATABASE_URL.
+  DATABASE_URL: postgres://jobrun:jobrun-local-only@postgres.jobrun.svc:5432/jobrun?sslmode=disable
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: { app: postgres }
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      securityContext:
+        fsGroup: 70
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          args: ["-c", "max_connections=200"]
+          envFrom:
+            - secretRef: { name: postgres }
+          env:
+            - name: POSTGRES_INITDB_ARGS
+              value: --data-checksums
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "jobrun", "-d", "jobrun"]
+            periodSeconds: 5
+          securityContext:
+            runAsUser: 70
+            runAsGroup: 70
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

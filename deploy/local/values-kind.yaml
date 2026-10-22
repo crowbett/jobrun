@@ -1,0 +1,38 @@
+# Values for the local kind proof (deploy/README.md). Short leases so lease recovery after
+# a killed worker shows up in seconds instead of ~40 s.
+image:
+  repository: jobrun
+  tag: dev
+  pullPolicy: Never # loaded with `kind load docker-image jobrun:dev`
+
+database:
+  existingSecret: postgres
+  secretKey: DATABASE_URL
+
+config:
+  appEnv: kind
+  logFormat: text
+  leaseTTL: 6s
+  heartbeatEvery: 2s
+
+server:
+  replicaCount: 2
+  queues: [default]
+  concurrency: 4
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+worker:
+  replicaCount: 2
+  queues: [remote]
+  concurrency: 4
+  resources:
+    requests: { cpu: 50m, memory: 32Mi }
+    limits: { memory: 128Mi }
+
+networkPolicy:
+  egress:
+    postgresTo:
+      - podSelector:
+          matchLabels: { app: postgres }
