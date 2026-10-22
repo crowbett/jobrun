@@ -1,0 +1,15 @@
+apiVersion: v2
+name: jobrun
+description: >-
+  Durable Postgres-backed job queue: jobrund (gRPC control plane, in-process worker pool,
+  cron scheduler, lease reaper, /metrics) plus optional out-of-process jobworker pods.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0" # gRPC probes (GA 1.27) and the preStop sleep action (beta, on by default since 1.30)
+home: https://github.com/crowbett/jobrun
+sources:
+  - https://github.com/crowbett/jobrun
+keywords: [job-queue, postgres, grpc, worker]
+maintainers:
+  - name: Corbett Jouett

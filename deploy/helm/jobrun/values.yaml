@@ -1,0 +1,222 @@
+# Default values for the jobrun chart.
+#
+# Two workloads share one image:
+#   server  - jobrund: gRPC :50052 (JobService, ScheduleService, WorkerService), in-process
+#             worker pool, advisory-lock-elected cron scheduler, lease reaper, admin :9110
+#             (/healthz, /metrics, /admin). Needs DATABASE_URL. Migrates on start.
+#   worker  - jobworker: leases jobs from the server over WorkerService (gRPC only, no
+#             database access). At-least-once effects; see pkg/jobworker.
+
+image:
+  repository: ghcr.io/crowbett/jobrun
+  # Defaults to .Chart.AppVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# DATABASE_URL for jobrund. Production: point existingSecret at a Secret you manage
+# (External Secrets, sealed-secrets, CSI driver...). `url` makes the chart render a
+# Secret from a plain value and is meant for local clusters only.
+database:
+  existingSecret: ""
+  secretKey: DATABASE_URL
+  url: ""
+
+# Shared jobrund settings (internal/config). Durations use Go syntax.
+config:
+  appEnv: prod
+  logLevel: info
+  logFormat: json
+  # Lease semantics: a job whose holder dies keeps its lease until leaseTTL runs out; the
+  # reaper (ticks every leaseTTL/3) then requeues it with backoff. Worst-case recovery
+  # after a hard kill is about leaseTTL + leaseTTL/3. heartbeatEvery must be < leaseTTL/2.
+  leaseTTL: 30s
+  heartbeatEvery: 10s
+  jobTimeout: 10m
+  pollFloor: 200ms
+  jobEvents: all # all | terminal
+  jobRetention: 168h
+  scheduler:
+    enabled: true
+    tick: 5s
+  otel:
+    enabled: false
+    endpoint: "" # e.g. http://otel-collector.observability:4317
+
+server:
+  replicaCount: 2
+  queues: [default]
+  concurrency: 16
+  batch: 32
+  # 0 = jobrund default (concurrency + 8). Must be >= concurrency + 2. Budget it against the
+  # database's max_connections across ALL replicas (HPA max x pgMaxConns).
+  pgMaxConns: 0
+
+  # Graceful termination. jobrund's teardown on SIGTERM is staged:
+  #   1. health NOT_SERVING, WorkerService.Drain, gRPC GracefulStop + admin drain  (shutdownTimeoutSeconds)
+  #   2. stop claiming, wait for in-flight handlers                                (30 s, fixed)
+  #   3. scheduler (releases the advisory lock) + reaper                           (10 s, fixed)
+  #   4. notifier + depth cache                                                    ( 5 s, fixed)
+  #   5. close the pgx pool, 6. flush OTel                                         ( 5 s, fixed)
+  # preStopSleepSeconds runs first so endpoints are removed before the drain begins.
+  # The chart fails to render if terminationGracePeriodSeconds is below
+  # preStopSleepSeconds + shutdownTimeoutSeconds + 50. Handlers still running when the
+  # grace period ends are SIGKILLed; their leases expire and the reaper requeues them.
+  shutdownTimeoutSeconds: 15
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 90
+
+  # gRPC probes hit grpc.health.v1.Health on :50052; /healthz is on the admin port.
+  # The gRPC listener only opens after migrations (bounded by a 30 s startup budget and a
+  # 25 s migration lock wait), so the startup probe allows 2 s x 45 = 90 s.
+  startupProbe:
+    grpc: { port: 50052 }
+    periodSeconds: 2
+    failureThreshold: 45
+    timeoutSeconds: 2
+  # Readiness asks for the JobService status, which flips to NOT_SERVING in teardown stage 1.
+  readinessProbe:
+    grpc: { port: 50052, service: jobrun.v1.JobService }
+    periodSeconds: 5
+    failureThreshold: 2
+    timeoutSeconds: 2
+  # Liveness is process-level only (/healthz does not touch Postgres), so a database outage
+  # makes pods unready but never restarts them.
+  livenessProbe:
+    httpGet: { path: /healthz, port: admin }
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 2
+
+  resources:
+    requests: { cpu: 250m, memory: 128Mi }
+    limits: { memory: 512Mi }
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    # Extra autoscaling/v2 metric entries appended verbatim (see worker.autoscaling).
+    extraMetrics: []
+
+  pdb:
+    enabled: true
+    minAvailable: 1
+
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # Empty = soft spread across zones and nodes for this component.
+  topologySpreadConstraints: []
+
+worker:
+  enabled: true
+  replicaCount: 2
+  queues: [remote]
+  concurrency: 8
+  jobTimeout: 10m
+  # jobworker on SIGTERM stops claiming, waits drainSeconds for in-flight handlers (still
+  # heartbeating them), then flushes OTel (5 s). The chart fails to render if
+  # terminationGracePeriodSeconds < drainSeconds + 10.
+  drainSeconds: 30
+  terminationGracePeriodSeconds: 45
+
+  resources:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+    # CPU is a poor signal for I/O-bound handlers. The better signal is backlog:
+    # jobrun_queue_depth{queue="remote",status="queued"} from jobrund's /metrics. Expose it
+    # through prometheus-adapter (External metric) or use KEDA's prometheus scaler, then
+    # append the metric here, e.g.:
+    # - type: External
+    #   external:
+    #     metric:
+    #       name: jobrun_queue_depth
+    #       selector: { matchLabels: { queue: remote, status: queued } }
+    #     target: { type: AverageValue, averageValue: "50" }
+    extraMetrics: []
+
+  pdb:
+    enabled: true
+    maxUnavailable: 1
+
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+service:
+  type: ClusterIP
+  grpcPort: 50052
+  adminPort: 9110
+  annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  # EKS IRSA: eks.amazonaws.com/role-arn: arn:aws:iam::<acct>:role/<name>
+  # (deploy/terraform/aws outputs it as jobrun_irsa_role_arn).
+  annotations: {}
+  # jobrund never calls the Kubernetes API. With IRSA the projected AWS token is mounted
+  # by the EKS webhook regardless of this setting.
+  automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# Neither gRPC nor the admin surface has authentication (README, Limitations), so the
+# network boundary IS the access control. Kubelet probes are host-originated and not
+# subject to these policies on mainstream CNIs.
+networkPolicy:
+  enabled: true
+  # Extra peers allowed to reach gRPC :50052, in addition to this release's worker pods.
+  # e.g. - podSelector: { matchLabels: { app: producer } }
+  grpcFrom: []
+  # Peers allowed to reach admin :9110 (/metrics, /admin). Empty = nobody but kubelet.
+  # e.g. - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: monitoring } }
+  adminFrom: []
+  egress:
+    enabled: true
+    # Postgres destinations for the server. Empty = any destination on postgresPort.
+    # RDS: - ipBlock: { cidr: 10.0.0.0/16 }
+    postgresTo: []
+    postgresPort: 5432
+    # OTLP collector, only when config.otel.enabled. Empty = any destination on otlpPort.
+    otlpTo: []
+    otlpPort: 4317
+
+metrics:
+  # prometheus.io/* annotations on server pods (for annotation-based scrape configs).
+  podAnnotations: true
+  serviceMonitor:
+    enabled: false # needs the monitoring.coreos.com/v1 CRDs (prometheus-operator)
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}

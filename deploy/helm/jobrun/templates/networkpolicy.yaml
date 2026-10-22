@@ -1,0 +1,110 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# Server: gRPC only from this release's workers (+ networkPolicy.grpcFrom), admin only from
+# networkPolicy.adminFrom; egress to DNS, Postgres and (optionally) the OTLP collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "jobrun.serverName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "server") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "server") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    - ports:
+        - port: grpc
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "worker") | nindent 14 }}
+        # helm test pod (templates/tests)
+        - podSelector:
+            matchLabels:
+              {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "test") | nindent 14 }}
+        {{- with $np.grpcFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- with $np.adminFrom }}
+    - ports:
+        - port: admin
+          protocol: TCP
+      from:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+  {{- if $np.egress.enabled }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: {{ $np.egress.postgresPort }}
+          protocol: TCP
+      {{- with $np.egress.postgresTo }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- if .Values.config.otel.enabled }}
+    - ports:
+        - port: {{ $np.egress.otlpPort }}
+          protocol: TCP
+      {{- with $np.egress.otlpTo }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- if .Values.worker.enabled }}
+---
+# Worker: no ingress at all; egress to DNS, the server's gRPC port and (optionally) OTLP.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "jobrun.workerName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "worker") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if $np.egress.enabled }}
+    - Egress
+    {{- end }}
+  ingress: []
+  {{- if $np.egress.enabled }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: {{ .Values.service.grpcPort }}
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "server") | nindent 14 }}
+    {{- if .Values.config.otel.enabled }}
+    - ports:
+        - port: {{ $np.egress.otlpPort }}
+          protocol: TCP
+      {{- with $np.egress.otlpTo }}
+      to:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

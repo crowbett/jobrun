@@ -1,0 +1,36 @@
+{{- include "jobrun.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "jobrun.serverName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "server") | nindent 4 }}
+data:
+  SERVICE_NAME: jobrun
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  GRPC_ADDR: {{ printf ":%d" (int .Values.service.grpcPort) | quote }}
+  # The admin port must be reachable by kubelet (liveness) and Prometheus. It has no auth:
+  # the NetworkPolicy restricts who can reach it (networkPolicy.adminFrom).
+  ADMIN_ADDR: {{ printf ":%d" (int .Values.service.adminPort) | quote }}
+  ADMIN_ALLOW_REMOTE: "true"
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  WORKER_QUEUES: {{ join "," .Values.server.queues | quote }}
+  WORKER_CONCURRENCY: {{ .Values.server.concurrency | quote }}
+  WORKER_BATCH: {{ .Values.server.batch | quote }}
+  {{- if gt (int .Values.server.pgMaxConns) 0 }}
+  PGX_MAX_CONNS: {{ .Values.server.pgMaxConns | quote }}
+  {{- end }}
+  LEASE_TTL: {{ .Values.config.leaseTTL | quote }}
+  HEARTBEAT_EVERY: {{ .Values.config.heartbeatEvery | quote }}
+  JOB_TIMEOUT: {{ .Values.config.jobTimeout | quote }}
+  POLL_FLOOR: {{ .Values.config.pollFloor | quote }}
+  JOB_EVENTS: {{ .Values.config.jobEvents | quote }}
+  JOB_RETENTION: {{ .Values.config.jobRetention | quote }}
+  SCHEDULER_ENABLED: {{ .Values.config.scheduler.enabled | quote }}
+  SCHEDULER_TICK: {{ .Values.config.scheduler.tick | quote }}
+  SHUTDOWN_TIMEOUT: {{ printf "%ds" (int .Values.server.shutdownTimeoutSeconds) | quote }}
+  OTEL_ENABLED: {{ .Values.config.otel.enabled | quote }}
+  {{- with .Values.config.otel.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}

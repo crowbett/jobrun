@@ -1,0 +1,29 @@
+{{- if .Values.server.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "jobrun.serverName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "server") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.server.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "server") | nindent 6 }}
+  # An unready pod (e.g. Postgres briefly unreachable) may still be evicted.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+{{- end }}
+{{- if and .Values.worker.enabled .Values.worker.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "jobrun.workerName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "worker") | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.worker.pdb.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "worker") | nindent 6 }}
+{{- end }}

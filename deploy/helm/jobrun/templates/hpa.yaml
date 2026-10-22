@@ -1,0 +1,45 @@
+{{- range $component := list "server" "worker" }}
+{{- $c := index $.Values $component }}
+{{- $enabled := or (eq $component "server") $.Values.worker.enabled }}
+{{- if and $enabled $c.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include (printf "jobrun.%sName" $component) $ }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" $component) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include (printf "jobrun.%sName" $component) $ }}
+  minReplicas: {{ $c.autoscaling.minReplicas }}
+  maxReplicas: {{ $c.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ $c.autoscaling.targetCPUUtilizationPercentage }}
+    {{- with $c.autoscaling.extraMetrics }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  behavior:
+    # Scale-down sends SIGTERM, which drains in-flight jobs (staged teardown / -drain);
+    # go slowly so a burst does not churn pods mid-job.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+{{- end }}
+{{- end }}

@@ -1,0 +1,16 @@
+jobrun {{ include "jobrun.imageTag" . }} is installed as release {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+gRPC (JobService, ScheduleService, WorkerService): {{ include "jobrun.grpcAddr" . }}
+Admin (/admin, /metrics, /healthz):              {{ include "jobrun.serverName" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.adminPort }}
+
+Neither surface has authentication.{{ if .Values.networkPolicy.enabled }} NetworkPolicies limit gRPC to this release's
+workers{{ if .Values.networkPolicy.grpcFrom }} and networkPolicy.grpcFrom{{ end }}, and admin to {{ if .Values.networkPolicy.adminFrom }}networkPolicy.adminFrom{{ else }}nobody (kubelet probes only){{ end }}.{{ else }} networkPolicy.enabled=false: anything in the cluster can reach both.{{ end }}
+
+Try it:
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "jobrun.serverName" . }} -- /jobrun health
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "jobrun.serverName" . }} -- /jobrun enqueue --type sleep --payload '{"ms":500}'
+  {{- if .Values.worker.enabled }}
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "jobrun.serverName" . }} -- /jobrun enqueue --queue {{ first .Values.worker.queues }} --type echo --payload '{"hi":1}'
+  {{- end }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "jobrun.serverName" . }} {{ .Values.service.adminPort }}   # then http://127.0.0.1:{{ .Values.service.adminPort }}/admin
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}

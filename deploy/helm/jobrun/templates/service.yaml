@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "jobrun.serverName" . }}
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "server") | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "jobrun.componentSelectorLabels" (dict "ctx" $ "component" "server") | nindent 4 }}
+  ports:
+    # gRPC connections are long-lived, so kube-proxy balances per connection, not per
+    # request: each jobworker pins one server pod until its Claim stream ends (the server
+    # ends them in teardown stage 1 and workers reconnect to another pod).
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+      appProtocol: grpc
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin
+      protocol: TCP
+      appProtocol: http

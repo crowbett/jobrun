@@ -1,0 +1,19 @@
+# CI render: every optional template on (HPAs, OTel egress, admin ingress).
+database:
+  existingSecret: jobrun-db
+config:
+  otel:
+    enabled: true
+    endpoint: http://otel-collector.observability:4317
+server:
+  autoscaling:
+    enabled: true
+worker:
+  autoscaling:
+    enabled: true
+networkPolicy:
+  adminFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+

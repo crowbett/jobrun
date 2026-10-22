@@ -1,0 +1,26 @@
+# `helm test <release>`: calls JobService health through the Service with the jobrun CLI
+# shipped in the image.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "jobrun.fullname" . }}-test-health
+  labels:
+    {{- include "jobrun.componentLabels" (dict "ctx" $ "component" "test") | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: health
+      image: {{ include "jobrun.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["/jobrun", "-addr", {{ include "jobrun.grpcAddr" . | quote }}, "health"]
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { memory: 64Mi }
