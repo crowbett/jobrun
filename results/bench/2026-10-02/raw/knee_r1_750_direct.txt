@@ -1,0 +1,15 @@
+# 2026-10-03T03:06:38Z round=1 cmd: jobrun bench --rate 750 --duration 30s --direct (fresh db jb_knee_r1_750_direct)
+bench: queue=bench type=noop rate=750/s duration=30s mode=direct workers=8
+t=+5s     queued=27     leased=15   enqueued=3750
+t=+10s    queued=44     leased=16   enqueued=7425
+t=+15s    queued=43     leased=15   enqueued=11175
+t=+20s    queued=0      leased=0    enqueued=14925
+t=+25s    queued=43     leased=11   enqueued=18675
+t=+30s    queued=59     leased=2    enqueued=22425
+enqueue: 22500 jobs in 30.1s (747.5/s achieved, 0 errors, 0 lagged ticks)
+drain:   22500/22500 terminal 3.3s after enqueue stopped (succeeded=22500 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=67ms p95=117ms p99=137ms max=173ms
+throughput: 22500 completed over 29.97s (first created -> last finished) = 750.7/s
+depth: max queued+leased while enqueuing = 61 (flat bound 1500 = 2s of the target rate, sampled every 5s)
+PASS: throughput 750.7/s >= 167/s, p99 137ms < 1s, depth flat, 22500/22500 succeeded
+# exit=0

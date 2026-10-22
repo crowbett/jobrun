@@ -1,0 +1,21 @@
+# 2026-10-03T02:56:43Z round=1 cmd: jobrun bench --rate 2000 --duration 30s --direct (fresh db jb_sat_r1_2000_direct)
+bench: queue=bench type=noop rate=2000/s duration=30s mode=direct workers=8
+t=+5s     queued=2125   leased=5    enqueued=9600
+t=+10s    queued=6232   leased=8    enqueued=19000
+t=+15s    queued=10246  leased=14   enqueued=28600
+t=+20s    queued=15209  leased=1    enqueued=38200
+t=+25s    queued=19944  leased=4    enqueued=48000
+t=+30s    queued=24414  leased=6    enqueued=58200
+enqueue: 60000 jobs in 30.84s (1945.8/s achieved, 0 errors, 0 lagged ticks)
+t=+35s    queued=26006  leased=4    enqueued=60000
+t=+40s    queued=20594  leased=1    enqueued=60000
+t=+45s    queued=15203  leased=4    enqueued=60000
+t=+50s    queued=9842   leased=5    enqueued=60000
+t=+55s    queued=4563   leased=8    enqueued=60000
+drain:   60000/60000 terminal 27.9s after enqueue stopped (succeeded=60000 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=13.084s p95=24.56s p99=25.606s max=25.97s
+throughput: 60000 completed over 56.61s (first created -> last finished) = 1059.9/s
+depth: max queued+leased while enqueuing = 26010 (flat bound 4000 = 2s of the target rate, sampled every 5s)
+FAIL: throughput 1059.9/s >= 167/s, p99 25.606s >= 1s, depth NOT flat, 60000/60000 succeeded
+error: bench criterion not met
+# exit=1

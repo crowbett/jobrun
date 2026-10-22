@@ -1,0 +1,27 @@
+# 2026-10-03T03:04:57Z round=3 cmd: jobrun bench --rate 3000 --duration 30s --direct (fresh db jb_sat_r3_3000_direct)
+bench: queue=bench type=noop rate=3000/s duration=30s mode=direct workers=8
+t=+5s     queued=3681   leased=8    enqueued=13200
+t=+10s    queued=12586  leased=14   enqueued=27000
+t=+15s    queued=21054  leased=6    enqueued=41100
+t=+20s    queued=29972  leased=4    enqueued=55500
+t=+25s    queued=38602  leased=8    enqueued=69600
+t=+30s    queued=47642  leased=6    enqueued=84300
+enqueue: 86700 jobs in 30.82s (2813.5/s achieved, 0 errors, 11 lagged ticks)
+t=+35s    queued=52507  leased=7    enqueued=86700
+t=+40s    queued=47186  leased=1    enqueued=86700
+t=+45s    queued=41926  leased=6    enqueued=86700
+t=+50s    queued=36649  leased=7    enqueued=86700
+t=+55s    queued=31474  leased=2    enqueued=86700
+t=+1m0s   queued=26665  leased=13   enqueued=86700
+t=+1m5s   queued=22500  leased=13   enqueued=86700
+t=+1m10s  queued=17394  leased=7    enqueued=86700
+t=+1m15s  queued=12100  leased=15   enqueued=86700
+t=+1m20s  queued=6955   leased=3    enqueued=86700
+t=+1m25s  queued=1699   leased=11   enqueued=86700
+drain:   86700/86700 terminal 58.3s after enqueue stopped (succeeded=86700 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=25.339s p95=50.526s p99=52.647s max=53.265s
+throughput: 86700 completed over 1m23.88s (first created -> last finished) = 1033.7/s
+depth: max queued+leased while enqueuing = 52514 (flat bound 6000 = 2s of the target rate, sampled every 5s)
+FAIL: throughput 1033.7/s >= 167/s, p99 52.647s >= 1s, depth NOT flat, 86700/86700 succeeded
+error: bench criterion not met
+# exit=1

@@ -202,14 +202,30 @@ observable instruments when `OTEL_ENABLED=true`; `deploy/grafana/jobrun.json` is
 `jobrun bench` is an open-loop enqueuer (ticker at `1/rate`, lagged ticks are counted, never queued),
 then a drain watch on the cached depth and a `List` sweep computing `finished_at - created_at`
 (both database-clock). Pass criterion from the plan: >= 167/s sustained, p99 < 1 s, flat depth
-(backlog never above 2 s of the target rate). Measured on this box (Windows 11, Postgres 17 in
-Docker Desktop/WSL2, defaults `WORKER_CONCURRENCY=16 WORKER_BATCH=32 POLL_FLOOR=200ms JOB_EVENTS=all`):
+(backlog never above 2 s of the target rate).
 
-| run | enqueued | achieved | completed | p50 | p95 | p99 | max | max depth | verdict |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `--rate 200 --duration 60s` (gRPC) | 11999 | 200.0/s | **200.3/s** | 6 ms | 7 ms | **9 ms** | 45 ms | 2 | PASS |
-| `--rate 500 --duration 30s` (gRPC) | 14996 | 499.8/s | 500.0/s | 8 ms | 11 ms | 23 ms | 40 ms | 6 | PASS |
-| `--rate 1000 --duration 30s --direct` | 30000 | 996.7/s | 996.8/s | 131 ms | 170 ms | 179 ms | 206 ms | 140 | PASS |
+**2026-10-02 rerun, quiet box** (Ryzen 7 3700X 8C/16T, 32 GB, Windows 11; Postgres 17 from `compose.yaml` in Docker
+Desktop/WSL2 with 16 CPUs / 15.6 GiB; defaults `WORKER_CONCURRENCY=16 WORKER_BATCH=32 POLL_FLOOR=200ms JOB_EVENTS=all`).
+Each run used a fresh database and a fresh `jobrund`. The rates ran interleaved in three rounds; the table shows the
+median of 3 with the range. Methodology, machine details and every raw `jobrun bench` output are in
+[`results/bench/2026-10-02/`](results/bench/2026-10-02/README.md). No run had an enqueue error, and every enqueued job succeeded.
+
+| run | completed/s | p50 | p99 median (range) | max depth | verdict | raw |
+| --- | --- | --- | --- | --- | --- | --- |
+| `--rate 200 --duration 60s` (gRPC) | **200.0** | 6 ms | **12 ms** (11-14) | 2-3 | 3/3 PASS | [r1](results/bench/2026-10-02/raw/main_r1_200_grpc.txt) [r2](results/bench/2026-10-02/raw/main_r2_200_grpc.txt) [r3](results/bench/2026-10-02/raw/main_r3_200_grpc.txt) |
+| `--rate 500 --duration 30s` (gRPC) | **499.9** (492.0-500.0) | 9 ms | **38 ms** (21-42) | 7-9 | 3/3 PASS | [r1](results/bench/2026-10-02/raw/main_r1_500_grpc.txt) [r2](results/bench/2026-10-02/raw/main_r2_500_grpc.txt) [r3](results/bench/2026-10-02/raw/main_r3_500_grpc.txt) |
+| `--rate 750 --duration 30s --direct` | **750.8** (750.7-751.0) | 66 ms | **137 ms** (114-149) | 61-75 | 3/3 PASS | [r1](results/bench/2026-10-02/raw/knee_r1_750_direct.txt) [r2](results/bench/2026-10-02/raw/knee_r2_750_direct.txt) [r3](results/bench/2026-10-02/raw/knee_r3_750_direct.txt) |
+| `--rate 1000 --duration 30s --direct` | 990.4 (979.4-993.8) | 188 ms | 1.042 s (0.634-1.155) | 119-865 | 1/3 PASS | [r1](results/bench/2026-10-02/raw/main_r1_1000_direct.txt) [r2](results/bench/2026-10-02/raw/main_r2_1000_direct.txt) [r3](results/bench/2026-10-02/raw/main_r3_1000_direct.txt) |
+| `--rate 1500/2000/3000 --duration 30s --direct` | **~1,030** (1,008-1,075, 9 runs) | 5-25 s | 13-52 s | grows | saturated | [`raw/sat_*`](results/bench/2026-10-02/raw/) |
+
+The saturation point is **~1,030 jobs/s completed** with 16 in-process workers on one Postgres. That holds whether
+1,500, 2,000 or 3,000/s is offered; above it the backlog grows linearly and latency is just queueing time. Offering
+1000/s sits right at that knee: throughput holds, but the backlog reached ~860 in two of three runs and p99 was about 1 s.
+An earlier single run (2026-09-19, raw output never committed) had reported 996.8/s at a 179 ms p99 there, and that
+**did not reproduce**. Over gRPC, `--rate 1000` reaches only ~680 enqueues/s (the client's 8 enqueuer goroutines are
+the limit; the server kept up with p99 29 ms). That run measures the client, so it is left out of the table
+([raw](results/bench/2026-10-02/raw/)). Numbers on a loaded desktop are much worse and measure the enqueuer: a 10 s
+`--rate 200` run on 2026-10-02 with other builds running only achieved 42.7/s.
 
 **Remote workers vs in-process at 500/s (2026-09-22, loaded box).** Six interleaved rounds
 (A B C D, 30 s each, `--rate 500 --type noop`) against fresh databases on the same Postgres, with
@@ -234,9 +250,9 @@ traceparent columns cost B vs A about +6 ms p50 / +13 ms p99, which is inside th
 loaded rounds. C vs D is within noise at this load. f11495e removes an empty claim transaction per
 completed job, which matters for Postgres load more than for latency.
 
-No knob tuning was needed; the target passes with 12x headroom on the direct path. The direct row's
-latency is the 100 ms COPY batch tick plus the poll floor, not the queue. Knobs that matter after
-that: `WORKER_BATCH` x `WORKER_CONCURRENCY` (claims per poll), `POLL_FLOOR`, `PGX_MAX_CONNS`,
+No knob tuning was needed: the 167/s target passes with ~6x headroom (saturation ~1,030/s). Below the
+knee, the direct rows' latency is mostly the 100 ms COPY batch tick plus the poll floor; near it, it is queueing.
+Knobs that matter after that: `WORKER_BATCH` x `WORKER_CONCURRENCY` (claims per poll), `POLL_FLOOR`, `PGX_MAX_CONNS`,
 `JOB_EVENTS=terminal` to halve the `job_events` writes.
 
 ## Teardown

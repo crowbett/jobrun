@@ -1,0 +1,15 @@
+# 2026-10-03T02:53:52Z round=3 cmd: jobrun bench --rate 500 --duration 30s  (fresh db jb_main_r3_500_grpc)
+bench: queue=bench type=noop rate=500/s duration=30s mode=grpc workers=8
+t=+5s     queued=3      leased=6    enqueued=2492
+t=+10s    queued=2      leased=2    enqueued=4992
+t=+15s    queued=2      leased=3    enqueued=7492
+t=+20s    queued=3      leased=2    enqueued=9992
+t=+25s    queued=3      leased=2    enqueued=12492
+t=+30s    queued=3      leased=2    enqueued=14992
+enqueue: 14995 jobs in 30s (499.8/s achieved, 0 errors, 0 lagged ticks)
+drain:   14995/14995 terminal 3.2s after enqueue stopped (succeeded=14995 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=9ms p95=14ms p99=42ms max=91ms
+throughput: 14995 completed over 29.99s (first created -> last finished) = 499.9/s
+depth: max queued+leased while enqueuing = 9 (flat bound 1000 = 2s of the target rate, sampled every 5s)
+PASS: throughput 499.9/s >= 167/s, p99 42ms < 1s, depth flat, 14995/14995 succeeded
+# exit=0

@@ -1,0 +1,21 @@
+# 2026-10-03T02:52:43Z round=3 cmd: jobrun bench --rate 200 --duration 60s  (fresh db jb_main_r3_200_grpc)
+bench: queue=bench type=noop rate=200/s duration=1m0s mode=grpc workers=8
+t=+5s     queued=1      leased=1    enqueued=999
+t=+10s    queued=1      leased=1    enqueued=1999
+t=+15s    queued=1      leased=1    enqueued=2999
+t=+20s    queued=1      leased=2    enqueued=3999
+t=+25s    queued=0      leased=1    enqueued=4999
+t=+30s    queued=1      leased=1    enqueued=5999
+t=+35s    queued=1      leased=1    enqueued=6999
+t=+40s    queued=1      leased=1    enqueued=7999
+t=+45s    queued=1      leased=1    enqueued=8999
+t=+50s    queued=1      leased=0    enqueued=9999
+t=+55s    queued=1      leased=1    enqueued=10999
+t=+1m0s   queued=1      leased=1    enqueued=11999
+enqueue: 12000 jobs in 1m0.01s (200.0/s achieved, 0 errors, 0 lagged ticks)
+drain:   12000/12000 terminal 3.3s after enqueue stopped (succeeded=12000 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=6ms p95=8ms p99=12ms max=61ms
+throughput: 12000 completed over 59.97s (first created -> last finished) = 200.1/s
+depth: max queued+leased while enqueuing = 3 (flat bound 400 = 2s of the target rate, sampled every 5s)
+PASS: throughput 200.1/s >= 167/s, p99 12ms < 1s, depth flat, 12000/12000 succeeded
+# exit=0

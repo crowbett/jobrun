@@ -1,0 +1,16 @@
+# 2026-10-03T02:54:31Z round=3 cmd: jobrun bench --rate 1000 --duration 30s --direct (fresh db jb_main_r3_1000_direct)
+bench: queue=bench type=noop rate=1000/s duration=30s mode=direct workers=8
+t=+5s     queued=72     leased=11   enqueued=4900
+t=+10s    queued=36     leased=13   enqueued=9800
+t=+15s    queued=35     leased=3    enqueued=14800
+t=+20s    queued=296    leased=11   enqueued=19800
+t=+25s    queued=856    leased=2    enqueued=24800
+t=+30s    queued=386    leased=14   enqueued=29900
+enqueue: 30000 jobs in 30.1s (996.7/s achieved, 0 errors, 0 lagged ticks)
+drain:   30000/30000 terminal 3.4s after enqueue stopped (succeeded=30000 dead=0 cancelled=0 other=0)
+latency (enqueue -> done, db clock): p50=188ms p95=972ms p99=1.042s max=1.081s
+throughput: 30000 completed over 30.19s (first created -> last finished) = 993.8/s
+depth: max queued+leased while enqueuing = 858 (flat bound 2000 = 2s of the target rate, sampled every 5s)
+FAIL: throughput 993.8/s >= 167/s, p99 1.042s >= 1s, depth flat, 30000/30000 succeeded
+error: bench criterion not met
+# exit=1
