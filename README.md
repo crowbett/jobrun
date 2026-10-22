@@ -11,7 +11,44 @@ No broker, no cron library, no Prometheus client: `SELECT ... FOR UPDATE SKIP LO
 `LISTEN/NOTIFY` does the dispatching and one Postgres does 1000 jobs/s off a partial index.
 Design record: [`docs/PLAN.md`](docs/PLAN.md) (ADR-0001; ADR-0002 for remote workers, fencing tokens, traceparent).
 
+**Results** (one Windows 11 box, Postgres 17 in Docker, medians of 3 interleaved runs; full table and raw output in
+[Benchmark](#benchmark)): it saturates at **~1,030 jobs/s completed** with the default 16 workers. Below that it runs
+**750 jobs/s at a 137 ms p99** on the direct-enqueue path, and **500 jobs/s at a 38 ms p99** / **200 jobs/s at a 12 ms p99**
+over gRPC, with flat queue depth and every job succeeding.
+
 ## Architecture
+
+```mermaid
+flowchart LR
+    cli["jobrun CLI<br/>(cmd/jobrun)"] -->|JobService / ScheduleService| grpc
+    rw["jobworker<br/>(cmd/jobworker, pkg/jobworker)"] <-->|"WorkerService<br/>Claim stream + Heartbeat/Complete/Fail"| grpc
+
+    subgraph jobrund["jobrund (cmd/jobrund)"]
+        grpc["gRPC :50052<br/>internal/interceptor -> internal/server"]
+        pool["worker Pool<br/>internal/worker + internal/handlers"]
+        sched["Scheduler<br/>internal/scheduler (cronx)"]
+        reaper["Reaper<br/>internal/reaper"]
+        notifier["Notifier<br/>LISTEN + poll floor"]
+        store["Store<br/>internal/postgres (sqlc, goose)"]
+        broker["Broker + depth cache<br/>internal/admin"]
+        grpc --> store
+        notifier -->|wake| pool
+        notifier -->|wake| grpc
+        pool -->|Claim / Heartbeat / Complete / Fail| store
+        sched -->|"Enqueue (advisory-lock leader)"| store
+        reaper -->|requeue expired leases, purge| store
+        pool -->|transitions| broker
+        reaper -->|transitions| broker
+        grpc -->|remote transitions| broker
+    end
+
+    store <--> pg[("Postgres 17<br/>jobs, job_events,<br/>schedules, processed_effects")]
+    notifier -. LISTEN jobrun_ready .- pg
+    broker --> admin["127.0.0.1:9110<br/>/admin (SSE), /admin/stats, /metrics"]
+    jobrund -. "OTLP (OTEL_ENABLED=true)" .-> otel["collector :4317"]
+```
+
+Request path:
 
 ```
  jobrun CLI / any gRPC client
@@ -40,6 +77,31 @@ Design record: [`docs/PLAN.md`](docs/PLAN.md) (ADR-0001; ADR-0002 for remote wor
         |
    Postgres 17 (:5434): jobs, job_events, schedules, processed_effects
 ```
+
+## Design decisions & trade-offs
+
+- **Postgres is the only moving part; no broker.** A claim is one round trip: a CTE with `FOR UPDATE SKIP LOCKED`
+  over a partial index feeds an `UPDATE` that sets the lease and bumps `attempts` and the fencing token
+  ([`db/query/jobs.sql:30`](db/query/jobs.sql#L30); index at [`00001_jobs.sql:31`](internal/postgres/migrations/00001_jobs.sql#L31)).
+  `LISTEN/NOTIFY` wakes claimers and a 200 ms poll floor makes a lost notification harmless. *Cost:* throughput is
+  bounded by one Postgres. NATS/JetStream was rejected for v1 because `List`/`Cancel`/`Retry`/priority would become
+  second-class and exactly-once would still need the DB ([`docs/PLAN.md`](docs/PLAN.md)).
+- **`pg_notify` runs inside the enqueue transaction** ([`internal/postgres/store.go:129`](internal/postgres/store.go#L129)):
+  Postgres delivers it only on commit, so a worker can never wake before the row is visible.
+- **Leases fenced by `(owner, lease_token)`, not visibility timeouts.** Heartbeat, `Complete` and `Fail` must present the
+  token ([`db/query/jobs.sql:76`](db/query/jobs.sql#L76)), so a stale attempt cannot finish a job, even one from the same
+  worker after a reap. A lease that could not be renewed in time is fenced locally: the handler's ctx is cancelled and its
+  result is never reported ([`internal/worker/heartbeat.go:121`](internal/worker/heartbeat.go#L121)). `attempts` increments
+  at claim, so a crash mid-job burns exactly one attempt.
+- **Exactly-once effects only where they can be honest.** A `job.TxHandler`'s `Commit` runs in the same transaction as the
+  owner-guarded completion `UPDATE` and a `processed_effects` dedupe row ([`internal/postgres/store.go:382`](internal/postgres/store.go#L382)).
+  *Cost:* it holds a row lock and a connection, so it is "writes only, no network" under a 5 s `statement_timeout`.
+  Remote workers cannot join that transaction, so they are documented as at-least-once.
+- **Small pieces built, not imported.** A 5-field cron parser with DST rules, table-tested and fuzzed
+  ([`internal/cronx`](internal/cronx)); a cron leader elected with `pg_try_advisory_lock` on a dedicated connection
+  ([`internal/postgres/lock.go:27`](internal/postgres/lock.go#L27)); hand-written `/metrics` and OTel instruments fed from
+  one snapshot so they cannot disagree ([`internal/obs/metrics.go:41`](internal/obs/metrics.go#L41)). Every time comparison
+  uses the database clock, and dead-letter is a status, not a table, so `retry` is one `UPDATE`.
 
 ## Guarantees
 
@@ -273,6 +335,27 @@ teardown 5/6: postgres pool closed
 teardown 6/6: otel flushed
 ```
 
+## Deploy
+
+[`deploy/README.md`](deploy/README.md) has the details and the full transcript.
+
+- **Kubernetes (Helm), run locally.** [`deploy/helm/jobrun`](deploy/helm/jobrun): jobrund server and
+  jobworker Deployments from one image, gRPC startup/readiness probes and `/healthz` liveness,
+  termination grace checked against the six-stage teardown at render time, PDBs, optional CPU HPAs
+  (queue-depth metric documented), NetworkPolicies restricting the gRPC/admin ports (the chart does
+  not set `GRPC_TOKEN` yet), non-root read-only pods, `helm test`. Installed on a 3-node kind cluster
+  (Kubernetes 1.37) with Postgres 17 in-cluster: jobs ran in-process and on remote workers, a
+  worker pod SIGKILLed while holding four leases had them requeued by the reaper 7 s later
+  (6 s demo TTL) and finished by the replacement pod on attempt 2, and a server pod stopped
+  gracefully drained its four in-flight jobs with no lease lost. Replicas > 1 start safely because
+  startup migrations are serialised by a session advisory lock (`internal/postgres/migrate.go`).
+- **AWS (Terraform), validated only.** [`deploy/terraform/aws`](deploy/terraform/aws): EKS, RDS
+  Postgres 17, VPC and a least-privilege IRSA role from the official `terraform-aws-modules`.
+  `terraform fmt`, `validate` and `tflint` pass; it has never been planned or applied against an
+  account. Its README has a cited rough cost estimate (about $204/month at the dev defaults).
+- **CI.** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) runs helm lint/template,
+  kubeconform on the rendered manifests and the Terraform checks; it touches no cluster or account.
+
 ## Testing and definition of done
 
 Unit tests run against in-memory fakes (`internal/worker`, `internal/scheduler`, `internal/reaper`,
@@ -291,6 +374,12 @@ the integration tests, `buf lint`, and `buf generate` leaving `gen/` unchanged.
 - Priority is bounded, not weighted: with `CLAIM_FIFO_EVERY=n` a low-priority job is never starved, but it only
   advances through the 1-in-n age-ordered claims (no per-priority quotas or aging of the priority itself).
 - Per-queue concurrency limits (one `WORKER_CONCURRENCY` covers every queue).
+- The `Dispatcher` seam for a NATS wake-up bus is reserved but not implemented; Postgres is the only backend.
+- Single Postgres: no tests against replicas, failover or PgBouncer transaction pooling (`LISTEN` needs a session connection).
+- `job_events` writes roughly four rows per job at `JOB_EVENTS=all`; retention purge keeps it bounded, partitioning is not done.
+- The benchmark figures come from one Windows 11 dev machine with Postgres in Docker Desktop/WSL2 (raw output in
+  [`results/bench/2026-10-02/`](results/bench/2026-10-02/README.md)); they have not been reproduced on Linux or dedicated hardware.
+- Tested against Postgres 17 only.
 
 ## License
 
