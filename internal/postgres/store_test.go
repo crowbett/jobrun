@@ -177,6 +177,70 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 }
 
+// TestMigrateConcurrent is several replicas starting against an empty schema
+// at once: the session lock serialises them, every call succeeds and each
+// migration is applied exactly once.
+func TestMigrateConcurrent(t *testing.T) {
+	t.Parallel()
+	url := os.Getenv(envDatabaseURL)
+	if url == "" {
+		t.Skipf("%s not set", envDatabaseURL)
+	}
+	ctx := context.Background()
+	var raw [6]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		t.Fatalf("random schema name: %v", err)
+	}
+	schema := "test_" + hex.EncodeToString(raw[:])
+	admin, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	t.Cleanup(func() {
+		defer admin.Close(ctx)
+		if _, err := admin.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Logf("drop schema %s: %v", schema, err)
+		}
+	})
+	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	const replicas = 4
+	pools := make([]*pgxpool.Pool, replicas)
+	for i := range pools {
+		cfg, err := pgxpool.ParseConfig(url)
+		if err != nil {
+			t.Fatalf("parse url: %v", err)
+		}
+		cfg.ConnConfig.RuntimeParams["search_path"] = schema
+		cfg.MaxConns = 4
+		if pools[i], err = postgres.OpenConfig(ctx, cfg, discard); err != nil {
+			t.Fatalf("open pool: %v", err)
+		}
+		t.Cleanup(pools[i].Close)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, replicas)
+	for i, p := range pools {
+		wg.Go(func() { errs[i] = postgres.Migrate(ctx, p) })
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("replica %d Migrate: %v", i, err)
+		}
+	}
+	var n int
+	if err := pools[0].QueryRow(ctx, "SELECT count(*) FROM goose_db_version WHERE version_id > 0").Scan(&n); err != nil {
+		t.Fatalf("goose_db_version: %v", err)
+	}
+	if n != 6 {
+		t.Fatalf("applied migrations: want 6 got %d", n)
+	}
+}
+
 func TestOpen(t *testing.T) {
 	t.Parallel()
 	url := os.Getenv(envDatabaseURL)
