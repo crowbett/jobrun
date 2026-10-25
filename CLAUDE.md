@@ -23,6 +23,7 @@ Module `github.com/crowbett/jobrun`, Go 1.27. Global Go conventions from the aut
 - `internal/admin/` - Broker, SSE, `/admin/stats`, `/metrics` text exposer, depth cache, histogram; `web/admin.html` embedded.
 - `internal/obs/` - OTel providers, slog trace ids, span helpers, `Snapshot` counters. `internal/config/` - env `Load()`/`Validate()`.
 - `internal/handlers/` - built-in `noop`, `sleep`, `fail`, `echo`. `internal/interceptor/` - Recover -> RequestID -> Logging.
+- `cmd/webdemo/` - js/wasm demo bridge for crowbett.github.io: `cronx` next runs and `job.Policy` retry ladders. Logic in `handler.go`; `main.go` is wasm-only.
 - `cmd/jobrund/main.go` - wiring only + the six-stage teardown. `cmd/jobrun/` - CLI (`main.go`, `jobs.go`, `schedule.go`, `bench.go`).
 
 ## Commands (Taskfile.yml)
