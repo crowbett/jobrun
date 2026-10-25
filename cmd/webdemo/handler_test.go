@@ -42,6 +42,11 @@ func TestCronDST(t *testing.T) {
 			[]string{"Sun 2026-01-04 00:00 UTC", "Sun 2026-01-11 00:00 UTC"},
 		},
 		{"nothing within the lookahead", CronParams{Expr: "0 0 30 2 *", Start: "2026-01-01T00:00:00Z", Count: 3}, []string{}},
+		{
+			"runs out within the lookahead",
+			CronParams{Expr: "0 0 29 2 *", Start: "2090-01-01T00:00:00Z", Count: 10},
+			[]string{"Fri 2092-02-29 00:00 UTC", "Wed 2096-02-29 00:00 UTC"},
+		},
 	}
 	for _, c := range cases {
 		r, err := Cron(c.p)
@@ -110,6 +115,17 @@ func TestBackoffDefaultsAndNoJitter(t *testing.T) {
 		if rt.DelaysMs[0] != want[i] || rt.DelaysMs[1] != want[i] {
 			t.Errorf("attempt %d without jitter: %v, want %d", rt.Attempt, rt.DelaysMs, want[i])
 		}
+	}
+}
+
+func TestBackoffSingleAttemptHasNoRetries(t *testing.T) {
+	t.Parallel()
+	r, err := Backoff(BackoffParams{Policy: json.RawMessage(`{}`), MaxAttempts: 1, Samples: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Retries) != 0 {
+		t.Errorf("got %d retries, want none (attempt 1 is final)", len(r.Retries))
 	}
 }
 
